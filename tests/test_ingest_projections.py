@@ -64,3 +64,83 @@ def test_merge_players_and_projections(tmp_path: Path):
     assert rec.projection == 18.5
     assert report.matched_players == 1
     assert not report.players_missing_projection
+
+
+def test_merge_handles_full_team_names(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "1,QB,Joe,Burrow,CIN,9000,20.1\n"
+        "2,WR,Tyreek,Hill,MIA,8900,19.4\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Joe Burrow,Cincinnati Bengals,$9100,23.5\n"
+        "Tyreek Hill,Miami Dolphins,$9000,22.1\n"
+    )
+
+    records, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert report.matched_players == 2
+    teams = {r.name: r.team for r in records}
+    assert teams["Joe Burrow"] == "CIN"
+    assert teams["Tyreek Hill"] == "MIA"
+
+
+def test_merge_handles_missing_salary(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "1,QB,Joe,Burrow,CIN,9000,20.1\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Joe Burrow,Cincinnati Bengals,N/A,23.5\n"
+    )
+
+    records, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert report.matched_players == 1
+    assert records[0].salary == 9000
+
+
+def test_merge_handles_defense_names(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "10,DEF,Miami,Dolphins,MIA,4500,6.5\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Miami D/ST,Miami Dolphins,$4400,7.1\n"
+    )
+
+    records, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert report.matched_players == 1
+    assert records[0].team == "MIA"
+    assert records[0].positions == ["D"]

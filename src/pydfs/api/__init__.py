@@ -227,6 +227,12 @@ def _render_index_page(
             const section = document.getElementById(sectionId);
             const hiddenInput = document.getElementById(hiddenInputId);
             const preview = document.getElementById(previewId);
+            if (!section || !hiddenInput) {{
+                return {{
+                    setHeaders() {{}},
+                }};
+            }}
+
             const rows = Array.from(section.querySelectorAll('.mapping-field')).map((row) => {{
                 const select = row.querySelector('select');
                 const customInput = row.querySelector('.custom-value');
@@ -360,7 +366,7 @@ def _render_index_page(
             if (!contents) {{
                 return [];
             }}
-            const lines = contents.replace(/\r\n/g, '\n').split('\n');
+            const lines = contents.replace(/\\r\\n/g, '\\n').split('\\n');
             const firstLine = lines.find((line) => line.trim().length > 0);
             if (!firstLine) {{
                 return [];
@@ -376,7 +382,9 @@ def _render_index_page(
             const file = input.files[0];
             const reader = new FileReader();
             reader.onload = (event) => {{
-                const headers = extractHeaders(event.target?.result);
+                const readerTarget = event && event.target ? event.target : {{}};
+                const contents = typeof readerTarget.result === 'string' ? readerTarget.result : '';
+                const headers = extractHeaders(contents);
                 callback(headers);
             }};
             reader.onerror = () => callback([]);

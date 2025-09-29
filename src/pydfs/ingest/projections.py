@@ -16,6 +16,59 @@ from pydfs.config import get_rules
 from pydfs.models import PlayerRecord
 
 
+NFL_TEAM_ALIAS_GROUPS: dict[str, list[str]] = {
+    "ARI": ["ARI", "ARIZONA", "ARIZONA CARDINALS", "ARIZONA CARDS", "ARIZONA DST", "ARIZONA D/ST"],
+    "ATL": ["ATL", "ATLANTA", "ATLANTA FALCONS", "ATLANTA DST", "ATLANTA D/ST"],
+    "BAL": ["BAL", "BALTIMORE", "BALTIMORE RAVENS", "BALTIMORE DST", "BALTIMORE D/ST", "BALTIMORE RAVENS DST"],
+    "BUF": ["BUF", "BUFFALO", "BUFFALO BILLS", "BUFFALO DST", "BUFFALO D/ST"],
+    "CAR": ["CAR", "CAROLINA", "CAROLINA PANTHERS", "CAROLINA DST", "CAROLINA D/ST"],
+    "CHI": ["CHI", "CHICAGO", "CHICAGO BEARS", "CHICAGO DST", "CHICAGO D/ST"],
+    "CIN": ["CIN", "CINCINNATI", "CINCINNATI BENGALS", "CINCINNATI DST", "CINCINNATI D/ST", "BENGALS"],
+    "CLE": ["CLE", "CLEVELAND", "CLEVELAND BROWNS", "CLEVELAND DST", "CLEVELAND D/ST", "BROWNS"],
+    "DAL": ["DAL", "DALLAS", "DALLAS COWBOYS", "DALLAS DST", "DALLAS D/ST"],
+    "DEN": ["DEN", "DENVER", "DENVER BRONCOS", "DENVER DST", "DENVER D/ST", "BRONCOS"],
+    "DET": ["DET", "DETROIT", "DETROIT LIONS", "DETROIT DST", "DETROIT D/ST", "LIONS"],
+    "GB": ["GB", "GNB", "GREEN BAY", "GREEN BAY PACKERS", "GREEN BAY DST", "PACKERS", "GREEN BAY D/ST"],
+    "HOU": ["HOU", "HOUSTON", "HOUSTON TEXANS", "HOUSTON DST", "HOUSTON D/ST", "TEXANS"],
+    "IND": ["IND", "INDIANAPOLIS", "INDIANAPOLIS COLTS", "INDIANAPOLIS DST", "INDIANAPOLIS D/ST", "COLTS"],
+    "JAX": ["JAX", "JAC", "JACKSONVILLE", "JACKSONVILLE JAGUARS", "JACKSONVILLE DST", "JACKSONVILLE D/ST", "JAGUARS"],
+    "KC": ["KC", "KAN", "KANSAS CITY", "KANSAS CITY CHIEFS", "KANSAS CITY DST", "KANSAS CITY D/ST", "CHIEFS"],
+    "LAC": ["LAC", "LACH", "LOS ANGELES CHARGERS", "LA CHARGERS", "SAN DIEGO", "SAN DIEGO CHARGERS", "CHARGERS", "LOS ANGELES CHARGERS DST"],
+    "LAR": ["LAR", "LA", "LOS ANGELES RAMS", "LA RAMS", "ST LOUIS", "ST LOUIS RAMS", "RAMS", "LOS ANGELES RAMS DST"],
+    "LV": ["LV", "LVR", "LAS VEGAS", "LAS VEGAS RAIDERS", "OAKLAND", "OAKLAND RAIDERS", "RAIDERS", "LAS VEGAS DST"],
+    "MIA": ["MIA", "MIAMI", "MIAMI DOLPHINS", "MIAMI DST", "MIAMI D/ST", "DOLPHINS"],
+    "MIN": ["MIN", "MINNESOTA", "MINNESOTA VIKINGS", "MINNESOTA DST", "MINNESOTA D/ST", "VIKINGS"],
+    "NE": ["NE", "NWE", "NEW ENGLAND", "NEW ENGLAND PATRIOTS", "NEW ENGLAND DST", "NEW ENGLAND D/ST", "PATRIOTS"],
+    "NO": ["NO", "NOR", "NEW ORLEANS", "NEW ORLEANS SAINTS", "NEW ORLEANS DST", "NEW ORLEANS D/ST", "SAINTS"],
+    "NYG": ["NYG", "NEW YORK", "NEW YORK GIANTS", "NY GIANTS", "GIANTS", "NEW YORK GIANTS DST"],
+    "NYJ": ["NYJ", "NEW YORK JETS", "NY JETS", "JETS", "NEW YORK JETS DST"],
+    "PHI": ["PHI", "PHILA", "PHILADELPHIA", "PHILADELPHIA EAGLES", "PHILADELPHIA DST", "PHILADELPHIA D/ST", "EAGLES"],
+    "PIT": ["PIT", "PITTSBURGH", "PITTSBURGH STEELERS", "PITTSBURGH DST", "PITTSBURGH D/ST", "STEELERS"],
+    "SEA": ["SEA", "SEATTLE", "SEATTLE SEAHAWKS", "SEATTLE DST", "SEATTLE D/ST", "SEAHAWKS"],
+    "SF": ["SF", "SFO", "SAN FRANCISCO", "SAN FRANCISCO 49ERS", "SF 49ERS", "49ERS", "SAN FRANCISCO DST", "SAN FRANCISCO D/ST"],
+    "TB": ["TB", "TAM", "TAMPA BAY", "TAMPA BAY BUCCANEERS", "TAMPA BAY DST", "TAMPA BAY D/ST", "BUCCANEERS", "BUCS"],
+    "TEN": ["TEN", "TENNESSEE", "TENNESSEE TITANS", "TENNESSEE DST", "TENNESSEE D/ST", "TITANS"],
+    "WAS": ["WAS", "WSH", "WASHINGTON", "WASHINGTON COMMANDERS", "WASHINGTON FOOTBALL TEAM", "WASHINGTON DST", "WASHINGTON D/ST", "COMMANDERS"],
+}
+
+
+def _team_token(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", value.upper())
+
+
+def _build_alias_lookup() -> dict[str, dict[str, str]]:
+    nfl_lookup: dict[str, str] = {}
+    for abbr, variants in NFL_TEAM_ALIAS_GROUPS.items():
+        for variant in variants:
+            key = _team_token(variant)
+            if key:
+                nfl_lookup.setdefault(key, abbr)
+    return {"NFL": nfl_lookup}
+
+
+TEAM_ALIAS_LOOKUP = _build_alias_lookup()
+
+
 class ProjectionRow(BaseModel):
     raw_id: Optional[str] = None
     raw_name: str
@@ -87,6 +140,18 @@ DEFAULT_PLAYERS_MAPPING = {
 }
 
 
+def _canonical_team(team: str, sport: str) -> str:
+    token = _team_token(team)
+    if not token:
+        return team.upper()
+    sport_key = sport.upper()
+    lookup = TEAM_ALIAS_LOOKUP.get(sport_key, {})
+    if token in lookup:
+        return lookup[token]
+    # Some data sources only provide the abbreviation already; ensure it stays uppercase.
+    return team.upper()
+
+
 def load_projection_csv(path: Path, *, mapping: Mapping[str, str] | None = None) -> List[ProjectionRow]:
     mapping = mapping or DEFAULT_PROJECTION_MAPPING
     with path.open(newline="", encoding="utf-8") as f:
@@ -95,9 +160,11 @@ def load_projection_csv(path: Path, *, mapping: Mapping[str, str] | None = None)
     return rows
 
 
-def _parse_salary(raw_salary: str) -> int:
+def _parse_salary(raw_salary: str, *, default: int | None = None) -> int:
     digits = re.sub(r"[^0-9]", "", raw_salary)
     if not digits:
+        if default is not None:
+            return default
         raise ValueError(f"salary '{raw_salary}' has no digits")
     return int(digits)
 
@@ -139,11 +206,12 @@ def rows_to_records(
         metadata = {}
         if row.ownership is not None:
             metadata["projected_ownership"] = row.ownership
+        team_abbrev = _canonical_team(row.raw_team, sport) if row.raw_team else ""
         records.append(
             PlayerRecord(
                 player_id=row.raw_id or row.raw_name,
                 name=row.raw_name,
-                team=row.raw_team.upper(),
+                team=team_abbrev,
                 positions=positions,
                 salary=_parse_salary(row.raw_salary),
                 projection=_parse_projection(row.raw_projection),
@@ -163,12 +231,25 @@ def load_records_from_csv(
     return rows_to_records(load_projection_csv(path, mapping=mapping), site=site, sport=sport)
 
 
-def _normalize_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+_NAME_SUFFIX_TOKENS = {"jr", "sr", "ii", "iii", "iv", "v"}
+_DEFENSE_TOKENS = {"dst", "defense", "def", "d"}
 
 
-def _record_key(name: str, team: str) -> str:
-    return f"{_normalize_name(name)}::{team.upper()}"
+def _normalize_name(name: str, *, is_defense: bool = False, team: str | None = None) -> str:
+    lowered = name.lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", lowered)
+    tokens = [tok for tok in cleaned.split() if tok]
+    tokens = [tok for tok in tokens if tok not in _NAME_SUFFIX_TOKENS]
+
+    if is_defense or any(tok in _DEFENSE_TOKENS for tok in tokens):
+        if team:
+            return team.lower()
+        tokens = [tok for tok in tokens if tok not in _DEFENSE_TOKENS]
+    return "".join(tokens)
+
+
+def _record_key(name: str, team: str, *, is_defense: bool = False) -> str:
+    return f"{_normalize_name(name, is_defense=is_defense, team=team)}::{team}"
 
 
 def merge_player_and_projection_files(
@@ -181,10 +262,10 @@ def merge_player_and_projection_files(
     projection_mapping: Optional[Mapping[str, str]] = None,
 ) -> Tuple[List[PlayerRecord], MergeReport]:
     players_rows = load_projection_csv(players_path, mapping=players_mapping or DEFAULT_PLAYERS_MAPPING)
-    base_records = {
-        _record_key(r.raw_name, r.raw_team): rec
-        for r, rec in zip(players_rows, rows_to_records(players_rows, site=site, sport=sport))
-    }
+    base_records = {}
+    for row, record in zip(players_rows, rows_to_records(players_rows, site=site, sport=sport)):
+        key = _record_key(row.raw_name, record.team, is_defense="D" in record.positions)
+        base_records[key] = record
 
     matched_keys: set[str] = set()
     unmatched_projection_rows: List[str] = []
@@ -200,10 +281,12 @@ def merge_player_and_projection_files(
 
     overlay_rows = load_projection_csv(projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING)
     for row in overlay_rows:
-        key = _record_key(row.raw_name, row.raw_team)
+        team_abbrev = _canonical_team(row.raw_team, sport)
+        positions = _canonical_positions(site, sport, row.raw_position)
+        is_defense = "D" in positions
+        key = _record_key(row.raw_name, team_abbrev, is_defense=is_defense)
         if key not in base_records:
             # create new record if enough info
-            positions = _canonical_positions(site, sport, row.raw_position)
             metadata = {}
             if row.ownership is not None:
                 metadata["projected_ownership"] = row.ownership
@@ -211,7 +294,7 @@ def merge_player_and_projection_files(
                 base_records[key] = PlayerRecord(
                     player_id=row.raw_id or row.raw_name,
                     name=row.raw_name,
-                    team=row.raw_team.upper(),
+                    team=team_abbrev,
                     positions=positions,
                     salary=_parse_salary(row.raw_salary),
                     projection=_parse_projection(row.raw_projection),
@@ -230,13 +313,15 @@ def merge_player_and_projection_files(
 
         update = {
             "projection": _parse_projection(row.raw_projection),
-            "salary": _parse_salary(row.raw_salary),
+            "salary": _parse_salary(row.raw_salary, default=existing.salary),
             "metadata": metadata,
         }
         if row.raw_position:
-            update["positions"] = _canonical_positions(site, sport, row.raw_position) or existing.positions
+            update["positions"] = positions or existing.positions
         if row.raw_id:
             update["player_id"] = row.raw_id
+        if team_abbrev:
+            update["team"] = team_abbrev
 
         base_records[key] = existing.model_copy(update=update)
 
@@ -253,6 +338,8 @@ def merge_player_and_projection_files(
         unmatched_projection_rows=unmatched_projection_rows,
     )
     return list(base_records.values()), report
+
+
 @dataclass(frozen=True)
 class MergeReport:
     total_players: int

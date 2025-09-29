@@ -42,6 +42,23 @@ DEFAULT_PROJECTION_MAPPING = {
     "ownership": "proj_own",
 }
 
+PLAYERS_MAPPING_FIELDS = [
+    ("player_id", "Player ID", "Unique identifier used to join players and projections."),
+    ("name", "Player Name", "Full player name; can combine columns with |."),
+    ("team", "Team", "Team abbreviation for roster rules."),
+    ("position", "Positions", "Slash- or comma-separated positions."),
+    ("salary", "Salary", "Player salary column."),
+    ("projection", "Projection", "Baseline projection included with player pool."),
+]
+
+PROJECTION_MAPPING_FIELDS = [
+    ("name", "Player Name", "Name column in the projections file."),
+    ("team", "Team", "Team column in the projections file."),
+    ("salary", "Salary", "Salary from projections to validate alignment."),
+    ("projection", "Projection", "Projection value used by the optimizer."),
+    ("ownership", "Ownership", "Optional ownership percentage column."),
+]
+
 
 def run_record_to_dict(run: RunRecord) -> dict:
     return {
@@ -84,6 +101,19 @@ def _render_page(body: str) -> str:
         .runs-list ul {{ list-style: none; padding: 0; }}
         .runs-list li {{ margin-bottom: 0.5rem; }}
         .runs-list a {{ color: #2563eb; text-decoration: none; }}
+        .mapping-section {{ border: 1px solid #e2e8f0; padding: 1rem; border-radius: 8px; background: #f8fafc; }}
+        .mapping-section + .mapping-section {{ margin-top: 0.5rem; }}
+        .mapping-grid {{ display: grid; gap: 1rem; margin-top: 0.75rem; }}
+        .mapping-field label {{ display: block; font-weight: 600; margin-bottom: 0.25rem; }}
+        .mapping-field select {{ width: 100%; padding: 0.5rem; border-radius: 6px; border: 1px solid #cbd5e1; background: #fff; }}
+        .mapping-field .custom-value {{ width: 100%; padding: 0.5rem; border-radius: 6px; border: 1px solid #cbd5e1; margin-top: 0.4rem; }}
+        .mapping-field small {{ display: block; color: #64748b; margin-top: 0.25rem; }}
+        .hint {{ color: #475569; margin: 0; }}
+        .mapping-preview {{ margin-top: 0.75rem; }}
+        .mapping-preview summary {{ cursor: pointer; color: #2563eb; }}
+        .mapping-preview pre {{ margin-top: 0.5rem; padding: 0.75rem; border-radius: 6px; background: #0f172a; color: #e2e8f0; overflow-x: auto; max-height: 240px; }}
+        .form-actions {{ display: flex; gap: 1rem; flex-wrap: wrap; }}
+        .form-actions button {{ flex: 1 1 200px; }}
     </style>
 </head>
 <body>
@@ -99,35 +129,290 @@ def _render_index_page(
     result,
     error: str | None,
     success: str | None,
-    players_mapping_json: str,
-    projection_mapping_json: str,
+    players_mapping: dict[str, str],
+    projection_mapping: dict[str, str],
     lineups_count: int,
 ) -> str:
-    players_mapping_html = escape(players_mapping_json)
-    projection_mapping_html = escape(projection_mapping_json)
+    def _mapping_section(
+        section_id: str,
+        title: str,
+        description: str,
+        fields: list[tuple[str, str, str]],
+        initial_mapping: dict[str, str],
+        preview_element_id: str,
+        hidden_input_id: str,
+    ) -> str:
+        rows_html = "".join(
+            f"""
+            <div class=\"mapping-field\" data-field=\"{field_key}\" data-initial=\"{escape(initial_mapping.get(field_key, ''))}\">
+                <label>{escape(label)}</label>
+                <select>
+                    <option value=\"\">Select column</option>
+                    <option value=\"__custom__\">Custom value…</option>
+                </select>
+                <input type=\"text\" class=\"custom-value\" placeholder=\"Custom column or pipeline (e.g. First Name|Last Name)\" style=\"display:none;\">
+                <small>{escape(help_text)}</small>
+            </div>
+            """
+            for field_key, label, help_text in fields
+        )
+        return f"""
+        <section id=\"{section_id}\" class=\"mapping-section\">
+            <h3>{escape(title)}</h3>
+            <p class=\"hint\">{escape(description)}</p>
+            <div class=\"mapping-grid\">{rows_html}</div>
+            <details class=\"mapping-preview\">
+                <summary>Show {escape(title.lower())} JSON</summary>
+                <pre id=\"{preview_element_id}\"></pre>
+            </details>
+            <input type=\"hidden\" name=\"{hidden_input_id}\" id=\"{hidden_input_id}\">
+        </section>
+        """
+
+    players_section = _mapping_section(
+        section_id="players-mapping",
+        title="Players Columns",
+        description="Match each required field to a column in your players CSV.",
+        fields=PLAYERS_MAPPING_FIELDS,
+        initial_mapping=players_mapping,
+        preview_element_id="players-mapping-preview",
+        hidden_input_id="players_mapping",
+    )
+
+    projection_section = _mapping_section(
+        section_id="projections-mapping",
+        title="Projections Columns",
+        description="Match each required field to a column in your projections CSV.",
+        fields=PROJECTION_MAPPING_FIELDS,
+        initial_mapping=projection_mapping,
+        preview_element_id="projection-mapping-preview",
+        hidden_input_id="projection_mapping",
+    )
 
     form_html = f"""
     <form method=\"post\" action=\"/ui\" enctype=\"multipart/form-data\">
         <label>Players CSV</label>
-        <input type=\"file\" name=\"players\" required>
+        <input type=\"file\" id=\"players-file\" name=\"players\" required>
 
         <label>Projections CSV</label>
-        <input type=\"file\" name=\"projections\" required>
+        <input type=\"file\" id=\"projections-file\" name=\"projections\" required>
 
-        <label>Players mapping (JSON)</label>
-        <textarea name=\"players_mapping\" rows=\"4\">{players_mapping_html}</textarea>
-
-        <label>Projections mapping (JSON)</label>
-        <textarea name=\"projection_mapping\" rows=\"4\">{projection_mapping_html}</textarea>
+        {players_section}
+        {projection_section}
 
         <label>Number of lineups</label>
         <input type=\"number\" name=\"lineups\" min=\"1\" value=\"{lineups_count}\">
 
-        <div>
+        <div class=\"form-actions\">
             <button type=\"submit\" name=\"submit_action\" value=\"preview\">Preview</button>
             <button type=\"submit\" name=\"submit_action\" value=\"lineups\" class=\"secondary\">Build Lineups</button>
         </div>
     </form>
+    """
+
+    def _safe_js_object(data: dict[str, str]) -> str:
+        json_text = json.dumps(data)
+        return json_text.replace("</", "<\\/")
+
+    initial_players_mapping_json = _safe_js_object(players_mapping)
+    initial_projection_mapping_json = _safe_js_object(projection_mapping)
+
+    mapping_script = f"""
+    <script>
+    (() => {{
+        const playersInitial = {initial_players_mapping_json};
+        const projectionsInitial = {initial_projection_mapping_json};
+
+        function createMappingController(sectionId, hiddenInputId, previewId, initialMapping) {{
+            const section = document.getElementById(sectionId);
+            const hiddenInput = document.getElementById(hiddenInputId);
+            const preview = document.getElementById(previewId);
+            const rows = Array.from(section.querySelectorAll('.mapping-field')).map((row) => {{
+                const select = row.querySelector('select');
+                const customInput = row.querySelector('.custom-value');
+                return {{
+                    key: row.dataset.field,
+                    row,
+                    select,
+                    customInput,
+                }};
+            }});
+
+            const state = {{ headers: [] }};
+
+            function rebuildOptions(select, headers) {{
+                select.innerHTML = '';
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = 'Select column';
+                select.appendChild(placeholder);
+                headers.forEach((header) => {{
+                    const option = document.createElement('option');
+                    option.value = header;
+                    option.textContent = header;
+                    select.appendChild(option);
+                }});
+                const customOption = document.createElement('option');
+                customOption.value = '__custom__';
+                customOption.textContent = 'Custom value…';
+                select.appendChild(customOption);
+            }}
+
+            function setFieldValue(field, value) {{
+                if (!value) {{
+                    field.select.value = '';
+                    field.customInput.value = '';
+                    field.customInput.style.display = 'none';
+                    return;
+                }}
+                if (state.headers.includes(value)) {{
+                    field.select.value = value;
+                    field.customInput.value = '';
+                    field.customInput.style.display = 'none';
+                    return;
+                }}
+                field.select.value = '__custom__';
+                field.customInput.value = value;
+                field.customInput.style.display = 'block';
+            }}
+
+            function getFieldValue(field) {{
+                if (field.select.value === '__custom__') {{
+                    return field.customInput.value.trim();
+                }}
+                return field.select.value.trim();
+            }}
+
+            function updateHidden() {{
+                const mapping = {{}};
+                rows.forEach((field) => {{
+                    const value = getFieldValue(field);
+                    if (value) {{
+                        mapping[field.key] = value;
+                    }}
+                }});
+                const jsonValue = JSON.stringify(mapping, null, 2);
+                hiddenInput.value = jsonValue;
+                if (preview) {{
+                    preview.textContent = jsonValue;
+                }}
+            }}
+
+            rows.forEach((field) => {{
+                rebuildOptions(field.select, state.headers);
+                const initialValue = initialMapping[field.key] ?? '';
+                setFieldValue(field, initialValue);
+                field.select.addEventListener('change', () => {{
+                    if (field.select.value === '__custom__') {{
+                        field.customInput.style.display = 'block';
+                        if (!field.customInput.value) {{
+                            field.customInput.focus();
+                        }}
+                    }} else {{
+                        field.customInput.style.display = 'none';
+                        field.customInput.value = '';
+                    }}
+                    updateHidden();
+                }});
+                field.customInput.addEventListener('input', updateHidden);
+            }});
+
+            updateHidden();
+
+            return {{
+                setHeaders(headers) {{
+                    state.headers = headers;
+                    rows.forEach((field) => {{
+                        const currentValue = getFieldValue(field) || (initialMapping[field.key] ?? '');
+                        rebuildOptions(field.select, headers);
+                        setFieldValue(field, currentValue);
+                    }});
+                    updateHidden();
+                }},
+            }};
+        }}
+
+        function splitCSV(line) {{
+            const result = [];
+            let current = '';
+            let inQuotes = false;
+            for (let i = 0; i < line.length; i += 1) {{
+                const char = line[i];
+                if (char === '"') {{
+                    if (inQuotes && line[i + 1] === '"') {{
+                        current += '"';
+                        i += 1;
+                    }} else {{
+                        inQuotes = !inQuotes;
+                    }}
+                }} else if (char === ',' && !inQuotes) {{
+                    result.push(current);
+                    current = '';
+                }} else {{
+                    current += char;
+                }}
+            }}
+            result.push(current);
+            return result;
+        }}
+
+        function extractHeaders(contents) {{
+            if (!contents) {{
+                return [];
+            }}
+            const lines = contents.replace(/\r\n/g, '\n').split('\n');
+            const firstLine = lines.find((line) => line.trim().length > 0);
+            if (!firstLine) {{
+                return [];
+            }}
+            return splitCSV(firstLine).map((header) => header.trim()).filter((header) => header.length > 0);
+        }}
+
+        function readHeadersFromInput(input, callback) {{
+            if (!input || !input.files || input.files.length === 0) {{
+                callback([]);
+                return;
+            }}
+            const file = input.files[0];
+            const reader = new FileReader();
+            reader.onload = (event) => {{
+                const headers = extractHeaders(event.target?.result);
+                callback(headers);
+            }};
+            reader.onerror = () => callback([]);
+            reader.readAsText(file);
+        }}
+
+        const playersController = createMappingController(
+            'players-mapping',
+            'players_mapping',
+            'players-mapping-preview',
+            playersInitial,
+        );
+        const projectionsController = createMappingController(
+            'projections-mapping',
+            'projection_mapping',
+            'projection-mapping-preview',
+            projectionsInitial,
+        );
+
+        const playersInput = document.getElementById('players-file');
+        const projectionsInput = document.getElementById('projections-file');
+
+        if (playersInput) {{
+            readHeadersFromInput(playersInput, (headers) => playersController.setHeaders(headers));
+            playersInput.addEventListener('change', () => {{
+                readHeadersFromInput(playersInput, (headers) => playersController.setHeaders(headers));
+            }});
+        }}
+        if (projectionsInput) {{
+            readHeadersFromInput(projectionsInput, (headers) => projectionsController.setHeaders(headers));
+            projectionsInput.addEventListener('change', () => {{
+                readHeadersFromInput(projectionsInput, (headers) => projectionsController.setHeaders(headers));
+            }});
+        }}
+    }})();
+    </script>
     """
 
     flash_html = ""
@@ -189,7 +474,7 @@ def _render_index_page(
     </section>
     """
 
-    body = flash_html + form_html + preview_html + result_html + runs_section
+    body = flash_html + form_html + preview_html + result_html + runs_section + mapping_script
     return _render_page(body)
 
 
@@ -310,9 +595,8 @@ async def _write_temp(upload: UploadFile | None) -> Path | None:
 def create_app() -> FastAPI:
     app = FastAPI(title="pydfs optimizer")
     store = RunStore(Path(__file__).resolve().parent.parent / "pydfs.sqlite")
-    # UI helpers rely on default mappings in JSON string form
-    default_players_mapping_json = _json_pretty(DEFAULT_PLAYERS_MAPPING)
-    default_projection_mapping_json = _json_pretty(DEFAULT_PROJECTION_MAPPING)
+    default_players_mapping = DEFAULT_PLAYERS_MAPPING.copy()
+    default_projection_mapping = DEFAULT_PROJECTION_MAPPING.copy()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -532,8 +816,8 @@ def create_app() -> FastAPI:
             result=None,
             error=None,
             success=None,
-            players_mapping_json=default_players_mapping_json,
-            projection_mapping_json=default_projection_mapping_json,
+            players_mapping=default_players_mapping.copy(),
+            projection_mapping=default_projection_mapping.copy(),
             lineups_count=20,
         )
         return HTMLResponse(content)
@@ -548,8 +832,8 @@ def create_app() -> FastAPI:
         projection_mapping: str = Form(""),
         lineups: int = Form(20),
     ):
-        parsed_players_mapping = _parse_mapping(players_mapping) or DEFAULT_PLAYERS_MAPPING
-        parsed_projection_mapping = _parse_mapping(projection_mapping) or DEFAULT_PROJECTION_MAPPING
+        parsed_players_mapping = _parse_mapping(players_mapping) or DEFAULT_PLAYERS_MAPPING.copy()
+        parsed_projection_mapping = _parse_mapping(projection_mapping) or DEFAULT_PROJECTION_MAPPING.copy()
 
         proj_path = await _write_temp(projections)
         players_path = await _write_temp(players)
@@ -639,8 +923,8 @@ def create_app() -> FastAPI:
             result=result,
             error=error,
             success=success,
-            players_mapping_json=_json_pretty(parsed_players_mapping),
-            projection_mapping_json=_json_pretty(parsed_projection_mapping),
+            players_mapping=parsed_players_mapping,
+            projection_mapping=parsed_projection_mapping,
             lineups_count=lineups,
         )
         return HTMLResponse(content)

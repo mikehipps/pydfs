@@ -83,6 +83,8 @@ def create_app() -> FastAPI:
                     players_mapping=_parse_mapping(players_mapping) or None,
                     projection_mapping=None,
                 )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             proj_path.unlink(missing_ok=True)
             if players_path:
@@ -143,6 +145,8 @@ def create_app() -> FastAPI:
                 max_repeating_players=request.max_repeating_players,
                 max_from_one_team=request.max_from_one_team,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
             proj_path.unlink(missing_ok=True)
             if players_path:

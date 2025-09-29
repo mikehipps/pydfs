@@ -120,7 +120,11 @@ def _canonical_positions(site: str, sport: str, position: Optional[str]) -> List
     valid = set().union(*rules.slot_positions.values())
     normalized = []
     for token in tokens:
-        normalized_token = token.replace("DST", "D")
+        normalized_token = token
+        if token in {"DST", "D/ST", "DEF", "DEFENSE"}:
+            normalized_token = "D"
+        elif token == "OL":
+            continue
         if normalized_token in valid:
             normalized.append(normalized_token)
     return normalized or tokens

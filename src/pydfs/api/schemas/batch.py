@@ -7,5 +7,6 @@ from .mapping import MappingPreviewResponse
 
 
 class LineupBatchResponse(BaseModel):
+    run_id: str
     report: MappingPreviewResponse
     lineups: list[LineupResponse]

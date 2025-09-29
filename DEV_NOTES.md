@@ -9,9 +9,9 @@ Running summary of major decisions and implementation details so future sessions
 - Canonical player model with projection ingestion supporting flexible column mappings.
 - CLI that merges players + projections, reports mismatches, exports lineups (with names/teams/positions/ownership) and optional JSON report. Profiles (`--save-profile`/`--load-profile`) persist column mappings.
 - Optimizer service wraps `pydfs-lineup-optimizer` with exposure controls.
-- FastAPI API (`/health`, `/preview`, `/lineups`) accepts file uploads + JSON payloads, supports ownership mapping, and returns merge stats alongside lineup payloads. Tests use sample CSVs to validate flow.
+- FastAPI API (`/health`, `/preview`, `/lineups`, `/runs`, `/runs/{id}`, `/runs/{id}/rerun`) accepts file uploads + JSON payloads, supports ownership mapping, persists run records, and exposes history/rerun functionality backed by SQLite (`RunStore`). `/ui` endpoints render lightweight HTML pages for upload/preview/run history without requiring external templating packages.
 - API tests run via `httpx.AsyncClient` with AnyIO; previously observed TestClient hang resolved.
-- HTTP client helper at `scripts/api_client.py` drives preview/lineups from the command line.
+- HTTP client helper at `scripts/api_client.py` drives preview/lineups from the command line. Supports run listing, retrieval, and CSV export.
 
 ## Testing
 - `python3 -m pytest` covers ingestion, optimizer, and API routes.

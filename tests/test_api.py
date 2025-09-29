@@ -61,6 +61,13 @@ async def test_preview_endpoint(client: AsyncClient):
 
 
 @pytest.mark.anyio
+async def test_ui_home(client: AsyncClient):
+    resp = await client.get("/ui")
+    assert resp.status_code == 200
+    assert "pydfs Optimizer" in resp.text
+
+
+@pytest.mark.anyio
 async def test_lineups_endpoint(client: AsyncClient):
     files = {
         "projections": ("projections.csv", _sample_projections(), "text/csv"),
@@ -73,9 +80,28 @@ async def test_lineups_endpoint(client: AsyncClient):
     resp = await client.post("/lineups", files=files, data=data)
     assert resp.status_code == 200
     payload = resp.json()
+    assert payload["run_id"]
     assert payload["report"]["matched_players"] == 9
     assert len(payload["lineups"]) == 1
     lineup = payload["lineups"][0]
     assert len(lineup["players"]) == 9
     # Ownership should be parsed through mapping
     assert lineup["players"][0]["ownership"] is not None
+
+    run_id = payload["run_id"]
+    resp = await client.get("/runs")
+    assert resp.status_code == 200
+    assert any(run["run_id"] == run_id for run in resp.json())
+
+    resp = await client.get(f"/runs/{run_id}")
+    assert resp.status_code == 200
+    detail = resp.json()
+    assert detail["run_id"] == run_id
+    assert detail["site"] == "FD"
+    assert detail["sport"] == "NFL"
+
+    resp = await client.post(f"/runs/{run_id}/rerun")
+    assert resp.status_code == 200
+    rerun_payload = resp.json()
+    assert rerun_payload["run_id"] == run_id
+    assert rerun_payload["lineups"], "Stored lineups should be returned"

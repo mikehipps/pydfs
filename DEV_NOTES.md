@@ -22,3 +22,32 @@ Running summary of major decisions and implementation details so future sessions
 - Harden API error responses and validation (e.g., better messaging for infeasible solves, profile management endpoints).
 
 Keep this file updated after each significant change set.
+
+## Session Summary (2025-02-09)
+- **Performance enhancements**: Added batch logging with per-batch elapsed times, configurable `lineups_per_job`, max exposure, and max repeating players across UI/API/CLI. Default solver gap now `gapRel=0.001` (override with `PYDFS_SOLVER_GAP`).
+- **UI/UX**: Form includes knobs for exposure/overlap/batch size; run detail pages only show top 100 most frequent lineups (with duplicate counts) and display configured run parameters.
+- **Player usage / uniqueness**: Backend tracks unique lineup counts per batch and surfaces player usage tables on run detail view. API responses include `player_usage`.
+- **Ingestion guardrails**: Negative projection values are now clamped to zero during CSV parsing to prevent validation errors from fallback FPPG columns.
+- **Randomness weighting**: Perturbation now scales with projection rank so elite players receive tighter noise while deep-value plays see larger swings (sport-agnostic).
+- **Roster hygiene**: Projection merges now drop players without projections, respect injury indicators (skip `OUT/IL` statuses), and—when sport is MLB—exclude non-probable pitchers if the flag is present.
+- **UI controls**: Added site/sport selectors and a minimum salary override so different slates can reuse the same flow without hard-coded NFL defaults.
+- **Partial runs & cancellation groundwork**: Optimizer raises `LineupGenerationPartial` with the lineups collected so far; API/CLI persist partial batches, surface a friendly message, and keep results instead of failing outright. Batch logs now include full position counts and salary caps for easier troubleshooting.
+- **Lineup analytics**: Run detail pages display usage-based metrics (usage sum, uniqueness) with percentile context and human-friendly formatting (M/B abbreviations). Summary table reports the same stats across the pool.
+- **Current workflow**:
+  - Typical run command: `PYDFS_SOLVER=cbc uvicorn pydfs.api:create_app --host 0.0.0.0 --port 8000`
+  - Preferred run settings during testing: `parallel_jobs≈10`, `lineups_per_job` tuned between 25–40, `max_exposure=0.5`, `max_repeating_players` optionally set for diversity.
+  - Batch logs now show total elapsed and per-batch time to help dial in parameters (watch for ~0.3s savings across ~200 batches ⇒ ~1 min overall).
+- **Open questions / next steps**:
+  1. Benchmark different `lineups_per_job` values (20/30/40/50) against uniqueness + wall time; record results for future reference.
+  2. Explore background job architecture or cancellation flag to support “stop & save” runs; currently synchronous HTTP flow prevents interruptions.
+  3. Investigate heuristic/“fast-pass” lineup generator for cheap diversity before full optimization.
+  4. Plan simulation pipeline integration once lineup generation parameters are finalized.
+  5. Design interactive “hand builder” tool: filter the 10k lineup pool by locked picks, update player usage counts in real time, and suggest completions (optionally calling the solver for fresh options).
+  6. Investigate a background “lineup pool maintainer”: keep solving for additional uniques once a slate is uploaded, and on projection updates rescore the existing pool and continue the search (handles late injury news).
+  7. Finish cancellation UX: wire UI button to the new `/runs/{id}/cancel` endpoint, ensure background workers respect cancel flags, and move generation into an interruptible flow.
+
+## Session Summary (2025-02-10)
+- **Job state tracking**: Added `run_jobs` table with helper methods so runs now carry lifecycle state (`running`, `cancel_requested`, `completed`, `failed`). `RunStore.save_run` finalises the job automatically.
+- **API surface**: `/runs` and `/runs/{id}` now include job metadata, `create_app` exposes the store via `app.state`, and the new `/runs/{id}/cancel` endpoint marks jobs as cancel-requested while returning their status.
+- **Tests**: Expanded API tests to cover job state responses and cancellation flow.
+- **Operational notes**: If uvicorn hangs, `pkill -9 -f "uvicorn pydfs.api:create_app"` followed by killing lingering multiprocessing helpers (`ps -fC python3`) clears the port. Restart command above reloads config. Partial results are saved per batch via `RunStore`; consider future enhancement to persist after each batch for safer cancellation.

@@ -1,5 +1,6 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from uuid import uuid4
 
 from pydfs.api import create_app
 
@@ -9,6 +10,7 @@ async def client():
     app = create_app()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as async_client:
+        async_client.app = app
         yield async_client
 
 
@@ -91,7 +93,8 @@ async def test_lineups_endpoint(client: AsyncClient):
     run_id = payload["run_id"]
     resp = await client.get("/runs")
     assert resp.status_code == 200
-    assert any(run["run_id"] == run_id for run in resp.json())
+    runs_payload = resp.json()
+    assert any(run["run_id"] == run_id and run["state"] == "completed" for run in runs_payload)
 
     resp = await client.get(f"/runs/{run_id}")
     assert resp.status_code == 200
@@ -99,9 +102,48 @@ async def test_lineups_endpoint(client: AsyncClient):
     assert detail["run_id"] == run_id
     assert detail["site"] == "FD"
     assert detail["sport"] == "NFL"
+    assert detail["state"] == "completed"
+    assert detail["job"] is not None
 
     resp = await client.post(f"/runs/{run_id}/rerun")
     assert resp.status_code == 200
     rerun_payload = resp.json()
     assert rerun_payload["run_id"] == run_id
     assert rerun_payload["lineups"], "Stored lineups should be returned"
+
+
+@pytest.mark.anyio
+async def test_cancel_endpoint(client: AsyncClient):
+    files = {
+        "projections": ("projections.csv", _sample_projections(), "text/csv"),
+        "players": ("players.csv", _sample_players(), "text/csv"),
+    }
+    data = {
+        "lineup_request": "{\"lineups\": 1}",
+        "projection_mapping": "{\"name\": \"player\", \"team\": \"team\", \"salary\": \"salary\", \"projection\": \"fantasy\", \"ownership\": \"proj_own\"}",
+    }
+    resp = await client.post("/lineups", files=files, data=data)
+    resp.raise_for_status()
+    run_id = resp.json()["run_id"]
+
+    cancel_resp = await client.post(f"/runs/{run_id}/cancel")
+    assert cancel_resp.status_code == 200
+    cancel_body = cancel_resp.json()
+    assert cancel_body["state"] == "completed"
+
+    store = client.app.state.run_store
+    pending_id = uuid4().hex
+    store.create_job(run_id=pending_id, site="FD", sport="NFL", state="running")
+
+    pending_cancel = await client.post(f"/runs/{pending_id}/cancel")
+    assert pending_cancel.status_code == 200
+    pending_body = pending_cancel.json()
+    assert pending_body["state"] == "cancel_requested"
+    assert pending_body["cancel_requested_at"] is not None
+
+    runs_resp = await client.get("/runs")
+    runs_resp.raise_for_status()
+    assert any(item["run_id"] == pending_id and item["state"] == "cancel_requested" for item in runs_resp.json())
+
+    missing = await client.post("/runs/does-not-exist/cancel")
+    assert missing.status_code == 404

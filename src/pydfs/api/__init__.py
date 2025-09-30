@@ -5,13 +5,16 @@ from __future__ import annotations
 import csv
 import json
 import tempfile
+import statistics
+from bisect import bisect_left, bisect_right
 from html import escape
 from io import StringIO
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, RedirectResponse
 
 from pydfs.api.schemas import (
     LineupBatchResponse,
@@ -19,10 +22,11 @@ from pydfs.api.schemas import (
     LineupRequest,
     LineupResponse,
     MappingPreviewResponse,
+    PlayerUsageResponse,
 )
 from pydfs.ingest import merge_player_and_projection_files
-from pydfs.optimizer import build_lineups
-from pydfs.persistence import RunRecord, RunStore
+from pydfs.optimizer import LineupGenerationPartial, build_lineups
+from pydfs.persistence import RunJob, RunRecord, RunStore
 
 
 DEFAULT_PLAYERS_MAPPING = {
@@ -42,6 +46,22 @@ DEFAULT_PROJECTION_MAPPING = {
     "ownership": "proj_own",
 }
 
+SITE_CHOICES: list[tuple[str, str]] = [
+    ("FD", "FanDuel Classic"),
+    ("FD_SINGLE", "FanDuel Single Game"),
+    ("DK", "DraftKings Classic"),
+    ("DK_CAPTAIN", "DraftKings Showdown"),
+    ("YAHOO", "Yahoo"),
+]
+
+SPORT_CHOICES: list[tuple[str, str]] = [
+    ("NFL", "NFL"),
+    ("NBA", "NBA"),
+    ("MLB", "MLB"),
+    ("NHL", "NHL"),
+    ("WNBA", "WNBA"),
+]
+
 PLAYERS_MAPPING_FIELDS = [
     ("player_id", "Player ID", "Unique identifier used to join players and projections."),
     ("name", "Player Name", "Full player name; can combine columns with |."),
@@ -60,18 +80,100 @@ PROJECTION_MAPPING_FIELDS = [
 ]
 
 
-def run_record_to_dict(run: RunRecord) -> dict:
+def _calculate_player_usage(lineups: list[LineupResponse]) -> list[PlayerUsageResponse]:
+    total_lineups = len(lineups)
+    if total_lineups == 0:
+        return []
+
+    usage: dict[str, dict[str, Any]] = {}
+    for lineup in lineups:
+        for player in lineup.players:
+            entry = usage.setdefault(
+                player.player_id,
+                {
+                    "name": player.name,
+                    "team": player.team,
+                    "positions": tuple(player.positions),
+                    "count": 0,
+                },
+            )
+            entry["count"] = int(entry["count"]) + 1
+
+    sorted_usage = sorted(
+        usage.items(),
+        key=lambda item: (-int(item[1]["count"]), str(item[1]["name"])),
+    )
+    return [
+        PlayerUsageResponse(
+            player_id=player_id,
+            name=str(data["name"]),
+            team=str(data["team"]),
+            positions=list(data["positions"]),
+            count=int(data["count"]),
+            exposure=int(data["count"]) / total_lineups,
+        )
+        for player_id, data in sorted_usage
+    ]
+
+
+def job_to_dict(job: RunJob) -> dict:
     return {
+        "run_id": job.run_id,
+        "state": job.state,
+        "site": job.site,
+        "sport": job.sport,
+        "message": job.message,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+        "cancel_requested_at": job.cancel_requested_at.isoformat() if job.cancel_requested_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+def run_record_to_dict(run: RunRecord, job: RunJob | None = None) -> dict:
+    lineups = [LineupResponse.model_validate(lineup) for lineup in run.lineups]
+    usage = _calculate_player_usage(lineups)
+    payload = {
         "run_id": run.run_id,
         "created_at": run.created_at.isoformat(),
         "site": run.site,
         "sport": run.sport,
         "request": run.request,
         "report": run.report,
-        "lineups": run.lineups,
+        "lineups": [lineup.model_dump() for lineup in lineups],
+        "player_usage": [item.model_dump() for item in usage],
         "players_mapping": run.players_mapping,
         "projection_mapping": run.projection_mapping,
     }
+    if job:
+        payload["state"] = job.state
+        payload["job"] = job_to_dict(job)
+    else:
+        payload["state"] = "completed"
+        payload["job"] = None
+    return payload
+
+
+def _format_large(value: float) -> str:
+    abs_value = abs(value)
+    if abs_value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if abs_value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if abs_value >= 1_000:
+        return f"{value:,.1f}"
+    return f"{value:.1f}"
+
+
+def _percentile(value: float, sorted_values: list[float], *, higher_is_better: bool = True) -> float:
+    if not sorted_values:
+        return 0.0
+    n = len(sorted_values)
+    if higher_is_better:
+        idx = bisect_right(sorted_values, value)
+        return 100.0 * idx / n
+    idx = bisect_left(sorted_values, value)
+    return 100.0 * (n - idx) / n
 
 
 def _json_pretty(data: dict) -> str:
@@ -132,6 +234,14 @@ def _render_index_page(
     players_mapping: dict[str, str],
     projection_mapping: dict[str, str],
     lineups_count: int,
+    parallel_jobs: int,
+    perturbation_value: float,
+    max_exposure_value: float,
+    lineups_per_job_value: int | None,
+    max_repeating_players_value: int | None,
+    site_value: str,
+    sport_value: str,
+    min_salary_value: int | None,
 ) -> str:
     def _mapping_section(
         section_id: str,
@@ -189,6 +299,15 @@ def _render_index_page(
         hidden_input_id="projection_mapping",
     )
 
+    site_options_html = "".join(
+        f'<option value="{escape(site)}"{" selected" if site == site_value else ""}>{escape(label)}</option>'
+        for site, label in SITE_CHOICES
+    )
+    sport_options_html = "".join(
+        f'<option value="{escape(sport)}"{" selected" if sport == sport_value else ""}>{escape(label)}</option>'
+        for sport, label in SPORT_CHOICES
+    )
+
     form_html = f"""
     <form method=\"post\" action=\"/ui\" enctype=\"multipart/form-data\">
         <label>Players CSV</label>
@@ -202,6 +321,30 @@ def _render_index_page(
 
         <label>Number of lineups</label>
         <input type=\"number\" name=\"lineups\" min=\"1\" value=\"{lineups_count}\">
+
+        <label>Site</label>
+        <select name=\"site\">{site_options_html}</select>
+
+        <label>Sport</label>
+        <select name=\"sport\">{sport_options_html}</select>
+
+        <label>Parallel workers</label>
+        <input type=\"number\" name=\"parallel_jobs\" min=\"1\" max=\"16\" value=\"{parallel_jobs}\">
+
+        <label>Projection perturbation (0-0.10)</label>
+        <input type=\"number\" name=\"perturbation\" min=\"0\" max=\"0.1\" step=\"0.005\" value=\"{perturbation_value:.3f}\">
+
+        <label>Max player exposure (0-1)</label>
+        <input type=\"number\" name=\"max_exposure\" min=\"0\" max=\"1\" step=\"0.05\" value=\"{max_exposure_value:.2f}\">
+
+        <label>Lineups per job (blank for auto)</label>
+        <input type=\"number\" name=\"lineups_per_job\" min=\"1\" max=\"1000\" value=\"{'' if lineups_per_job_value is None else lineups_per_job_value}\">
+
+        <label>Max repeating players (blank for default)</label>
+        <input type=\"number\" name=\"max_repeating_players\" min=\"0\" max=\"8\" value=\"{'' if max_repeating_players_value is None else max_repeating_players_value}\">
+
+        <label>Minimum salary (blank to use site default)</label>
+        <input type=\"number\" name=\"min_salary\" min=\"0\" step=\"100\" value=\"{'' if min_salary_value is None else min_salary_value}\">
 
         <div class=\"form-actions\">
             <button type=\"submit\" name=\"submit_action\" value=\"preview\">Preview</button>
@@ -449,22 +592,35 @@ def _render_index_page(
 
     result_html = ""
     if result:
+        top_lineup = result["lineup"]
+        min_salary_display = result.get("min_salary")
+        min_salary_text = "" if not min_salary_display else f" – Min Salary {min_salary_display}"
+        usage_lookup = result.get("usage_lookup") or {
+            item.player_id: item.exposure for item in _calculate_player_usage([top_lineup])
+        }
+        lineup_usage_sum = sum(usage_lookup.get(player.player_id, 0.0) for player in top_lineup.players) * 100
+        usage_product = 1.0
+        for player in top_lineup.players:
+            usage_product *= max(usage_lookup.get(player.player_id, 0.0), 1e-6)
+        uniqueness_score = 1.0 / usage_product
+        uniqueness_text = _format_large(uniqueness_score)
         lineup_rows = "".join(
             f"<tr><td>{'/'.join(player.positions)}</td>"
             f"<td>{escape(player.name)}</td>"
             f"<td>{escape(player.team)}</td>"
             f"<td>{player.salary}</td>"
+            f"<td>{player.baseline_projection:.2f}</td>"
             f"<td>{player.projection:.2f}</td>"
-            f"<td>{'-' if player.ownership is None else f'{player.ownership:.1f}'}</td></tr>"
-            for player in result["lineup"].players
+            f"<td>{usage_lookup.get(player.player_id, 0.0) * 100:.1f}%</td></tr>"
+            for player in top_lineup.players
         )
         result_html = f"""
         <section>
             <h2>Run Saved</h2>
             <p>Run ID: <a href=\"/ui/runs/{result['run_id']}\">{result['run_id']}</a></p>
-            <h3>Top Lineup</h3>
+            <h3>Top Lineup – Baseline {top_lineup.baseline_projection:.2f} (perturbed {top_lineup.projection:.2f}){min_salary_text} – Usage Sum {lineup_usage_sum:.1f}% – Uniqueness {uniqueness_text}</h3>
             <table>
-                <thead><tr><th>Position</th><th>Player</th><th>Team</th><th>Salary</th><th>Projection</th><th>Ownership</th></tr></thead>
+                <thead><tr><th>Position</th><th>Player</th><th>Team</th><th>Salary</th><th>Baseline Projection</th><th>Perturbed Projection</th><th>Usage</th></tr></thead>
                 <tbody>{lineup_rows}</tbody>
             </table>
         </section>
@@ -490,7 +646,7 @@ def _run_to_csv(run: RunRecord) -> str:
     buffer = StringIO()
     writer = csv.writer(buffer)
     writer.writerow([
-        "run_id", "lineup_id", "slot", "player_id", "name", "team", "positions", "salary", "projection", "ownership"
+        "run_id", "lineup_id", "slot", "player_id", "name", "team", "positions", "salary", "projection", "baseline_projection", "ownership"
     ])
     for lineup_data in run.lineups:
         lineup = LineupResponse.model_validate(lineup_data)
@@ -505,6 +661,7 @@ def _run_to_csv(run: RunRecord) -> str:
                 "/".join(player.positions),
                 player.salary,
                 f"{player.projection:.4f}",
+                f"{player.baseline_projection:.4f}",
                 "" if player.ownership is None else f"{player.ownership:.2f}",
             ])
     return buffer.getvalue()
@@ -513,26 +670,177 @@ def _run_to_csv(run: RunRecord) -> str:
 
 def _render_run_detail_page(run: RunRecord) -> str:
     report = run.report
+    lineups = [LineupResponse.model_validate(lineup_data) for lineup_data in run.lineups]
+    usage = _calculate_player_usage(lineups)
+    usage_lookup = {item.player_id: item.exposure for item in usage}
+    lineup_usage_sums: list[float] = []
+    lineup_uniqueness_scores: list[float] = []
+    lineup_metrics: dict[tuple[str, ...], dict[str, float]] = {}
+    for lineup in lineups:
+        signature = tuple(sorted(player.player_id for player in lineup.players))
+        exposures = [usage_lookup.get(player.player_id, 0.0) for player in lineup.players]
+        usage_sum = sum(exposures) * 100
+        product = 1.0
+        for expo in exposures:
+            product *= max(expo, 1e-6)
+        uniqueness = 1.0 / product
+        lineup_usage_sums.append(usage_sum)
+        lineup_uniqueness_scores.append(uniqueness)
+        lineup_metrics[signature] = {
+            "usage_sum": usage_sum,
+            "uniqueness": uniqueness,
+            "baseline": lineup.baseline_projection,
+        }
+    baseline_scores = [lineup.baseline_projection for lineup in lineups]
+    unique_players_used = {
+        player.player_id for lineup in lineups for player in lineup.players
+    }
+    baseline_sorted = sorted(baseline_scores)
+    usage_sorted = sorted(lineup_usage_sums)
+    uniqueness_sorted = sorted(lineup_uniqueness_scores)
+
+    if baseline_scores:
+        mean_score = statistics.fmean(baseline_scores)
+        median_score = statistics.median(baseline_scores)
+        std_score = statistics.pstdev(baseline_scores) if len(baseline_scores) > 1 else 0.0
+        sorted_scores = sorted(baseline_scores, reverse=True)
+        top10_count = max(1, int(len(sorted_scores) * 0.10))
+        top1_count = max(1, int(len(sorted_scores) * 0.01))
+        top10_avg = sum(sorted_scores[:top10_count]) / top10_count
+        top1_avg = sum(sorted_scores[:top1_count]) / top1_count
+    else:
+        mean_score = median_score = std_score = top10_avg = top1_avg = 0.0
+        top10_count = top1_count = 0
+
+    if lineup_usage_sums:
+        usage_mean = statistics.fmean(lineup_usage_sums)
+        usage_median = statistics.median(lineup_usage_sums)
+        usage_std = statistics.pstdev(lineup_usage_sums) if len(lineup_usage_sums) > 1 else 0.0
+    else:
+        usage_mean = usage_median = usage_std = 0.0
+
+    if lineup_uniqueness_scores:
+        uniqueness_mean = statistics.fmean(lineup_uniqueness_scores)
+        uniqueness_median = statistics.median(lineup_uniqueness_scores)
+        uniqueness_std = statistics.pstdev(lineup_uniqueness_scores) if len(lineup_uniqueness_scores) > 1 else 0.0
+    else:
+        uniqueness_mean = uniqueness_median = uniqueness_std = 0.0
+
+    for signature, data in lineup_metrics.items():
+        data["baseline_percentile"] = _percentile(data["baseline"], baseline_sorted) if baseline_sorted else 0.0
+        data["usage_percentile"] = _percentile(data["usage_sum"], usage_sorted, higher_is_better=False) if usage_sorted else 0.0
+        data["uniqueness_percentile"] = _percentile(data["uniqueness"], uniqueness_sorted) if uniqueness_sorted else 0.0
+
+    def _lineup_signature(players: list[LineupPlayerResponse]) -> tuple[str, ...]:
+        return tuple(sorted(player.player_id for player in players))
+
+    lineup_groups: dict[tuple[str, ...], dict[str, object]] = {}
+    for lineup in lineups:
+        key = _lineup_signature(lineup.players)
+        group = lineup_groups.setdefault(
+            key,
+            {
+                "count": 0,
+                "lineup": lineup,
+            },
+        )
+        group["count"] = int(group["count"]) + 1
+
+    sorted_lineups = sorted(
+        lineup_groups.values(),
+        key=lambda data: (
+            -int(data["count"]),
+            -cast(LineupResponse, data["lineup"]).baseline_projection,
+        ),
+    )
+
+    top_lineups = sorted_lineups[:100]
+    total_unique = len(sorted_lineups)
     lineups_html_parts = []
-    for lineup_data in run.lineups:
-        lineup = LineupResponse.model_validate(lineup_data)
+    for entry in top_lineups:
+        lineup = cast(LineupResponse, entry["lineup"])  # stored above
+        count = int(entry["count"])
+        signature = _lineup_signature(lineup.players)
+        metrics = lineup_metrics.get(signature, {"usage_sum": 0.0, "uniqueness": 0.0, "baseline": lineup.baseline_projection,
+                                                 "baseline_percentile": 0.0, "usage_percentile": 0.0, "uniqueness_percentile": 0.0})
+        baseline_pct = metrics.get("baseline_percentile", 0.0)
+        usage_pct = metrics.get("usage_percentile", 0.0)
+        uniqueness_pct = metrics.get("uniqueness_percentile", 0.0)
+        usage_sum_value = metrics["usage_sum"]
+        uniqueness_value = metrics["uniqueness"]
         rows = "".join(
             f"<tr><td>{'/'.join(player.positions)}</td><td>{escape(player.name)}</td><td>{escape(player.team)}</td>"
-            f"<td>{player.salary}</td><td>{player.projection:.2f}</td><td>{'-' if player.ownership is None else f'{player.ownership:.1f}'}</td></tr>"
+            f"<td>{player.salary}</td><td>{player.baseline_projection:.2f}</td><td>{player.projection:.2f}</td><td>{usage_lookup.get(player.player_id, 0.0) * 100:.1f}%</td></tr>"
             for player in lineup.players
         )
         lineups_html_parts.append(
-            f"<h3>{lineup.lineup_id} – Salary {lineup.salary} – Projection {lineup.projection:.2f}</h3>"
-            f"<table><thead><tr><th>Position</th><th>Player</th><th>Team</th><th>Salary</th><th>Projection</th><th>Ownership</th></tr></thead>"
+            f"<h3>{lineup.lineup_id} – Salary {lineup.salary} – Baseline {lineup.baseline_projection:.2f} ({baseline_pct:.0f}%) "
+            f"(perturbed {lineup.projection:.2f}, x{count}) – Usage Sum {usage_sum_value:.1f}% ({usage_pct:.0f}%) – Uniqueness {_format_large(uniqueness_value)} ({uniqueness_pct:.0f}%)</h3>"
+            f"<table><thead><tr><th>Position</th><th>Player</th><th>Team</th><th>Salary</th><th>Baseline Projection</th><th>Perturbed Projection</th><th>Usage</th></tr></thead>"
             f"<tbody>{rows}</tbody></table>"
         )
     lineups_html = "".join(lineups_html_parts)
+
+    if total_unique > len(top_lineups):
+        lineups_html += f"<p>Showing top {len(top_lineups)} of {total_unique} unique lineups by frequency.</p>"
+
+    if baseline_scores:
+        stats_html = f"""
+        <section>
+            <h2>Lineup Summary</h2>
+            <table>
+                <tr><th>Total lineups</th><td>{len(lineups)}</td></tr>
+                <tr><th>Unique players used</th><td>{len(unique_players_used)}</td></tr>
+                <tr><th>Mean baseline projection</th><td>{mean_score:.2f}</td></tr>
+                <tr><th>Median baseline projection</th><td>{median_score:.2f}</td></tr>
+                <tr><th>Std. dev.</th><td>{std_score:.2f}</td></tr>
+                <tr><th>Top 10% average ({top10_count} lineups)</th><td>{top10_avg:.2f}</td></tr>
+                <tr><th>Top 1% average ({max(top1_count, 1)} lineup{'s' if top1_count != 1 else ''})</th><td>{top1_avg:.2f}</td></tr>
+                <tr><th>Mean usage sum</th><td>{usage_mean:.1f}%</td></tr>
+                <tr><th>Median usage sum</th><td>{usage_median:.1f}%</td></tr>
+                <tr><th>Usage std. dev.</th><td>{usage_std:.1f}</td></tr>
+                <tr><th>Mean uniqueness</th><td>{_format_large(uniqueness_mean)}</td></tr>
+                <tr><th>Median uniqueness</th><td>{_format_large(uniqueness_median)}</td></tr>
+                <tr><th>Uniqueness std. dev.</th><td>{_format_large(uniqueness_std)}</td></tr>
+            </table>
+        </section>
+        """
+    else:
+        stats_html = ""
+
+    usage_rows = "".join(
+        f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td>"
+        f"<td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
+        for item in usage
+    ) or "<tr><td colspan=5>No lineups generated.</td></tr>"
+    usage_table = f"""
+    <section>
+        <h2>Player Usage</h2>
+        <table>
+            <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
+            <tbody>{usage_rows}</tbody>
+        </table>
+    </section>
+    """
+
+    max_exposure_display = run.request.get("max_exposure")
+    max_repeating_display = run.request.get("max_repeating_players")
+    min_salary_display = run.request.get("min_salary")
+    if isinstance(max_exposure_display, (int, float)):
+        max_exposure_display = f"{max_exposure_display:.2f}"
+    else:
+        max_exposure_display = "-"
+    max_repeating_display = "-" if max_repeating_display is None else str(max_repeating_display)
+    min_salary_display = "-" if min_salary_display in (None, "") else str(min_salary_display)
 
     body = f"""
     <section>
         <h1>Run {run.run_id}</h1>
         <p><strong>Created:</strong> {run.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}</p>
         <p><strong>Site/Sport:</strong> {run.site} {run.sport}</p>
+        <p><strong>Max Exposure:</strong> {max_exposure_display}</p>
+        <p><strong>Max Repeating Players:</strong> {max_repeating_display}</p>
+        <p><strong>Min Salary:</strong> {min_salary_display}</p>
 
         <h2>Merge Report</h2>
         <table>
@@ -542,6 +850,8 @@ def _render_run_detail_page(run: RunRecord) -> str:
             <tr><th>Unmatched Projections</th><td>{len(report['unmatched_projection_rows'])}</td></tr>
         </table>
     </section>
+    {stats_html}
+    {usage_table}
     <section>
         <h2>Lineups</h2>
         {lineups_html}
@@ -603,6 +913,7 @@ async def _write_temp(upload: UploadFile | None) -> Path | None:
 def create_app() -> FastAPI:
     app = FastAPI(title="pydfs optimizer")
     store = RunStore(Path(__file__).resolve().parent.parent / "pydfs.sqlite")
+    app.state.run_store = store
     default_players_mapping = DEFAULT_PLAYERS_MAPPING.copy()
     default_projection_mapping = DEFAULT_PROJECTION_MAPPING.copy()
 
@@ -616,6 +927,8 @@ def create_app() -> FastAPI:
         players: UploadFile | None = File(None),
         projection_mapping: str | None = Form(None),
         players_mapping: str | None = Form(None),
+        site: str = Form("FD"),
+        sport: str = Form("NFL"),
     ) -> MappingPreviewResponse:
         proj_path = await _write_temp(projections)
         players_path = await _write_temp(players)
@@ -627,8 +940,8 @@ def create_app() -> FastAPI:
                 _, report = merge_player_and_projection_files(
                     players_path=players_path,
                     projections_path=proj_path,
-                    site="FD",
-                    sport="NFL",
+                    site=site,
+                    sport=sport,
                     players_mapping=_parse_mapping(players_mapping) or None,
                     projection_mapping=_parse_mapping(projection_mapping) or None,
                 )
@@ -636,8 +949,8 @@ def create_app() -> FastAPI:
                 _, report = merge_player_and_projection_files(
                     players_path=proj_path,
                     projections_path=None,
-                    site="FD",
-                    sport="NFL",
+                    site=site,
+                    sport=sport,
                     players_mapping=_parse_mapping(players_mapping) or None,
                     projection_mapping=None,
                 )
@@ -647,6 +960,34 @@ def create_app() -> FastAPI:
             proj_path.unlink(missing_ok=True)
             if players_path:
                 players_path.unlink(missing_ok=True)
+
+        if 'lineups_payload' in locals():
+            store.save_run(
+                run_id=run_id,
+                site=site,
+                sport=sport,
+                request={
+                    "lineups": lineups,
+                    "max_repeating_players": max_repeating_players,
+                    "max_exposure": max_exposure,
+                    "lineups_per_job": lineups_per_job,
+                    "site": site,
+                    "sport": sport,
+                    "min_salary": min_salary,
+                },
+                report={
+                    "total_players": report.total_players,
+                    "matched_players": report.matched_players,
+                    "players_missing_projection": report.players_missing_projection,
+                    "unmatched_projection_rows": report.unmatched_projection_rows,
+                },
+                lineups=[lineup.model_dump() for lineup in lineups_payload],
+                players_mapping=parsed_players_mapping,
+                projection_mapping=parsed_projection_mapping,
+            )
+            if partial_message:
+                error = partial_message
+                success = None
 
         return MappingPreviewResponse(
             total_players=report.total_players,
@@ -662,9 +1003,18 @@ def create_app() -> FastAPI:
         lineup_request: str = Form("{}"),
         projection_mapping: str | None = Form(None),
         players_mapping: str | None = Form(None),
+        parallel_jobs: int = Form(1),
+        perturbation: float = Form(0.0),
+        max_exposure: float = Form(0.5),
+        lineups_per_job: int | None = Form(None),
+        max_repeating_players_form: int | None = Form(None),
+        site_form: str = Form("FD"),
+        sport_form: str = Form("NFL"),
+        min_salary_form: int | None = Form(None),
     ) -> LineupBatchResponse:
         try:
-            request = LineupRequest.model_validate(json.loads(lineup_request or "{}"))
+            raw_request = json.loads(lineup_request or "{}")
+            request = LineupRequest.model_validate(raw_request)
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid lineup_request JSON: {exc}") from exc
 
@@ -675,14 +1025,46 @@ def create_app() -> FastAPI:
 
         parsed_players_mapping = _parse_mapping(players_mapping) or {}
         parsed_projection_mapping = _parse_mapping(projection_mapping) or {}
+        if request.parallel_jobs is not None:
+            parallel_jobs = request.parallel_jobs
+        if request.perturbation is not None:
+            perturbation = request.perturbation
+        if request.max_exposure is not None:
+            max_exposure = request.max_exposure
+        site = raw_request.get("site") or site_form
+        sport = raw_request.get("sport") or sport_form
+        min_salary = raw_request.get("min_salary") if raw_request.get("min_salary") is not None else min_salary_form
+        request = request.model_copy(update={"site": site, "sport": sport, "min_salary": min_salary})
+        site = request.site
+        sport = request.sport
+        max_repeating_players = request.max_repeating_players
+        if max_repeating_players is None:
+            max_repeating_players = max_repeating_players_form
+        lineups_per_job = request.lineups_per_job if request.lineups_per_job is not None else lineups_per_job
+        parallel_jobs = max(1, parallel_jobs)
+        perturbation = max(0.0, min(0.1, perturbation))
+        max_exposure = max(0.0, min(1.0, max_exposure))
+        if lineups_per_job is not None:
+            lineups_per_job = max(1, min(1000, lineups_per_job))
+        if max_repeating_players is not None:
+            max_repeating_players = max(0, max_repeating_players)
 
+        run_id = uuid4().hex
+        store.create_job(
+            run_id=run_id,
+            site=site,
+            sport=sport,
+            state="running",
+        )
+
+        partial_message: str | None = None
         try:
             if players_path:
                 records, report = merge_player_and_projection_files(
                     players_path=players_path,
                     projections_path=proj_path,
-                    site=request.site,
-                    sport=request.sport,
+                    site=site,
+                    sport=sport,
                     players_mapping=parsed_players_mapping or None,
                     projection_mapping=parsed_projection_mapping or None,
                 )
@@ -690,24 +1072,36 @@ def create_app() -> FastAPI:
                 records, report = merge_player_and_projection_files(
                     players_path=proj_path,
                     projections_path=None,
-                    site=request.site,
-                    sport=request.sport,
+                    site=site,
+                    sport=sport,
                     players_mapping=parsed_players_mapping or None,
                     projection_mapping=None,
                 )
 
             lineups = build_lineups(
                 records,
-                site=request.site,
-                sport=request.sport,
+                site=site,
+                sport=sport,
                 n_lineups=request.lineups,
                 lock_player_ids=request.lock_player_ids,
                 exclude_player_ids=request.exclude_player_ids,
-                max_repeating_players=request.max_repeating_players,
+                max_repeating_players=max_repeating_players,
                 max_from_one_team=request.max_from_one_team,
+                parallel_jobs=parallel_jobs,
+                perturbation=perturbation,
+                lineups_per_job=lineups_per_job,
+                max_exposure=max_exposure,
+                min_salary=min_salary,
             )
         except ValueError as exc:
+            store.update_job_state(run_id, state="failed", message=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LineupGenerationPartial as exc:
+            partial_message = exc.message
+            lineups = exc.lineups
+        except Exception as exc:  # pragma: no cover - defensive guard for unexpected errors
+            store.update_job_state(run_id, state="failed", message=str(exc))
+            raise
         finally:
             proj_path.unlink(missing_ok=True)
             if players_path:
@@ -717,6 +1111,7 @@ def create_app() -> FastAPI:
                 lineup_id=lineup.lineup_id,
                 salary=lineup.salary,
                 projection=lineup.projection,
+                baseline_projection=lineup.baseline_projection,
                 players=[
                     LineupPlayerResponse(
                         player_id=player.player_id,
@@ -726,24 +1121,30 @@ def create_app() -> FastAPI:
                         salary=player.salary,
                         projection=player.projection,
                         ownership=player.ownership,
+                        baseline_projection=player.baseline_projection,
                     )
                     for player in lineup.players
                 ],
             )
             for lineup in lineups
         ]
+        player_usage = _calculate_player_usage(lineups_payload)
 
-        run_id = uuid4().hex
         store.save_run(
             run_id=run_id,
-            site=request.site,
-            sport=request.sport,
+            site=site,
+            sport=sport,
             request={
                 "lineups": request.lineups,
                 "lock_player_ids": request.lock_player_ids,
                 "exclude_player_ids": request.exclude_player_ids,
-                "max_repeating_players": request.max_repeating_players,
+                "max_repeating_players": max_repeating_players,
                 "max_from_one_team": request.max_from_one_team,
+                "max_exposure": max_exposure,
+                "lineups_per_job": lineups_per_job,
+                "site": site,
+                "sport": sport,
+                "min_salary": min_salary,
             },
             report={
                 "total_players": report.total_players,
@@ -756,7 +1157,10 @@ def create_app() -> FastAPI:
             projection_mapping=parsed_projection_mapping,
         )
 
-        return LineupBatchResponse(
+        if partial_message:
+            store.update_job_state(run_id, state="completed", message=partial_message)
+
+        response = LineupBatchResponse(
             run_id=run_id,
             report=MappingPreviewResponse(
                 total_players=report.total_players,
@@ -765,20 +1169,53 @@ def create_app() -> FastAPI:
                 unmatched_projection_rows=report.unmatched_projection_rows,
             ),
             lineups=lineups_payload,
+            player_usage=player_usage,
+            message=partial_message,
         )
+        return response
 
     @app.get("/runs")
     async def list_runs(limit: int = 50):
-        runs = store.list_runs(limit=limit)
-        return [
-            {
-                "run_id": run.run_id,
-                "created_at": run.created_at.isoformat(),
-                "site": run.site,
-                "sport": run.sport,
-            }
-            for run in runs
-        ]
+        jobs = store.list_jobs(limit=limit)
+        summaries: list[dict[str, Any]] = []
+        for job in jobs:
+            run = store.get_run(job.run_id)
+            created_at = run.created_at if run else job.created_at
+            summaries.append(
+                {
+                    "run_id": job.run_id,
+                    "created_at": created_at.isoformat(),
+                    "site": job.site,
+                    "sport": job.sport,
+                    "state": job.state,
+                    "message": job.message,
+                    "updated_at": job.updated_at.isoformat(),
+                    "cancel_requested_at": job.cancel_requested_at.isoformat() if job.cancel_requested_at else None,
+                    "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                    "has_results": run is not None,
+                }
+            )
+        if len(summaries) < limit:
+            existing_ids = {item["run_id"] for item in summaries}
+            for run in store.list_runs(limit=limit):
+                if run.run_id in existing_ids:
+                    continue
+                summaries.append(
+                    {
+                        "run_id": run.run_id,
+                        "created_at": run.created_at.isoformat(),
+                        "site": run.site,
+                        "sport": run.sport,
+                        "state": "completed",
+                        "message": None,
+                        "updated_at": run.created_at.isoformat(),
+                        "cancel_requested_at": None,
+                        "completed_at": run.created_at.isoformat(),
+                        "has_results": True,
+                    }
+                )
+        summaries.sort(key=lambda item: item["created_at"], reverse=True)
+        return summaries[:limit]
 
     def _fetch_run_or_404(run_id: str):
         run = store.get_run(run_id)
@@ -789,11 +1226,13 @@ def create_app() -> FastAPI:
     @app.get("/runs/{run_id}")
     async def get_run(run_id: str):
         run = _fetch_run_or_404(run_id)
-        return run_record_to_dict(run)
+        job = store.get_job(run_id)
+        return run_record_to_dict(run, job)
 
     @app.post("/runs/{run_id}/rerun", response_model=LineupBatchResponse)
     async def rerun(run_id: str):
         run = _fetch_run_or_404(run_id)
+        lineups = [LineupResponse.model_validate(lineup) for lineup in run.lineups]
         return LineupBatchResponse(
             run_id=run.run_id,
             report=MappingPreviewResponse(
@@ -802,8 +1241,33 @@ def create_app() -> FastAPI:
                 players_missing_projection=run.report["players_missing_projection"],
                 unmatched_projection_rows=run.report["unmatched_projection_rows"],
             ),
-            lineups=[LineupResponse.model_validate(lineup) for lineup in run.lineups],
+            lineups=lineups,
+            player_usage=_calculate_player_usage(lineups),
         )
+
+    @app.post("/runs/{run_id}/cancel")
+    async def cancel_run(run_id: str):
+        job = store.get_job(run_id)
+        if job is None:
+            run = store.get_run(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            return {
+                "run_id": run.run_id,
+                "state": "completed",
+                "site": run.site,
+                "sport": run.sport,
+                "message": None,
+                "created_at": run.created_at.isoformat(),
+                "updated_at": run.created_at.isoformat(),
+                "cancel_requested_at": None,
+                "completed_at": run.created_at.isoformat(),
+            }
+        if job.state in {"completed", "failed", "canceled"}:
+            return job_to_dict(job)
+        cancel_message = job.message or "Cancellation requested"
+        updated = store.mark_job_cancel_requested(run_id, message=cancel_message)
+        return job_to_dict(updated)
 
     @app.get("/runs/{run_id}/export.csv")
     async def export_csv(run_id: str):
@@ -827,6 +1291,14 @@ def create_app() -> FastAPI:
             players_mapping=default_players_mapping.copy(),
             projection_mapping=default_projection_mapping.copy(),
             lineups_count=20,
+            parallel_jobs=1,
+            perturbation_value=0.0,
+            max_exposure_value=0.5,
+            lineups_per_job_value=None,
+            max_repeating_players_value=None,
+            site_value="FD",
+            sport_value="NFL",
+            min_salary_value=None,
         )
         return HTMLResponse(content)
 
@@ -839,9 +1311,25 @@ def create_app() -> FastAPI:
         players_mapping: str = Form(""),
         projection_mapping: str = Form(""),
         lineups: int = Form(20),
+        max_repeating_players: int | None = Form(None),
+        parallel_jobs: int = Form(1),
+        perturbation: float = Form(0.0),
+        max_exposure: float = Form(0.5),
+        lineups_per_job: int | None = Form(None),
+        site: str = Form("FD"),
+        sport: str = Form("NFL"),
+        min_salary: int | None = Form(None),
     ):
         parsed_players_mapping = _parse_mapping(players_mapping) or DEFAULT_PLAYERS_MAPPING.copy()
         parsed_projection_mapping = _parse_mapping(projection_mapping) or DEFAULT_PROJECTION_MAPPING.copy()
+
+        parallel_jobs = max(1, parallel_jobs)
+        perturbation = max(0.0, min(0.1, perturbation))
+        max_exposure = max(0.0, min(1.0, max_exposure))
+        if lineups_per_job is not None:
+            lineups_per_job = max(1, min(1000, lineups_per_job))
+        if max_repeating_players is not None:
+            max_repeating_players = max(0, max_repeating_players)
 
         proj_path = await _write_temp(projections)
         players_path = await _write_temp(players)
@@ -852,13 +1340,16 @@ def create_app() -> FastAPI:
         result = None
         error = None
         success = None
+        redirect_url: str | None = None
 
+        partial_message: str | None = None
+        run_id = uuid4().hex
         try:
             records, report = merge_player_and_projection_files(
                 players_path=players_path,
                 projections_path=proj_path,
-                site="FD",
-                sport="NFL",
+                site=site,
+                sport=sport,
                 players_mapping=parsed_players_mapping,
                 projection_mapping=parsed_projection_mapping,
             )
@@ -869,15 +1360,21 @@ def create_app() -> FastAPI:
             else:
                 built_lineups = build_lineups(
                     records,
-                    site="FD",
-                    sport="NFL",
+                    site=site,
+                    sport=sport,
                     n_lineups=lineups,
-                )
+                    max_repeating_players=max_repeating_players,
+                    parallel_jobs=parallel_jobs,
+                    perturbation=perturbation,
+                lineups_per_job=lineups_per_job,
+                max_exposure=max_exposure,
+            )
                 lineups_payload = [
                     LineupResponse(
                         lineup_id=lineup.lineup_id,
                         salary=lineup.salary,
                         projection=lineup.projection,
+                        baseline_projection=lineup.baseline_projection,
                         players=[
                             LineupPlayerResponse(
                                 player_id=player.player_id,
@@ -887,42 +1384,68 @@ def create_app() -> FastAPI:
                                 salary=player.salary,
                                 projection=player.projection,
                                 ownership=player.ownership,
+                                baseline_projection=player.baseline_projection,
                             )
                             for player in lineup.players
                         ],
                     )
                     for lineup in built_lineups
                 ]
-
-                run_id = uuid4().hex
-                store.save_run(
-                    run_id=run_id,
-                    site="FD",
-                    sport="NFL",
-                    request={"lineups": lineups},
-                    report={
-                        "total_players": report.total_players,
-                        "matched_players": report.matched_players,
-                        "players_missing_projection": report.players_missing_projection,
-                        "unmatched_projection_rows": report.unmatched_projection_rows,
-                    },
-                    lineups=[lineup.model_dump() for lineup in lineups_payload],
-                    players_mapping=parsed_players_mapping,
-                    projection_mapping=parsed_projection_mapping,
-                )
+                player_usage = _calculate_player_usage(lineups_payload)
+                usage_lookup_mapping = {item.player_id: item.exposure for item in player_usage}
 
                 success = f"Run saved with ID {run_id}"
-                result = {
-                    "run_id": run_id,
-                    "lineup": lineups_payload[0],
-                }
+                if lineups_payload:
+                    result = {
+                        "run_id": run_id,
+                        "lineup": lineups_payload[0],
+                        "usage_lookup": usage_lookup_mapping,
+                        "min_salary": min_salary,
+                    }
+                redirect_url = f"/ui/runs/{run_id}"
 
         except ValueError as exc:
             error = str(exc)
+        except LineupGenerationPartial as exc:
+            partial_message = exc.message
+            lineups_payload = [
+                LineupResponse(
+                    lineup_id=lineup.lineup_id,
+                    salary=lineup.salary,
+                    projection=lineup.projection,
+                    baseline_projection=lineup.baseline_projection,
+                    players=[
+                        LineupPlayerResponse(
+                            player_id=player.player_id,
+                            name=player.name,
+                            team=player.team,
+                            positions=list(player.positions),
+                            salary=player.salary,
+                            projection=player.projection,
+                            ownership=player.ownership,
+                            baseline_projection=player.baseline_projection,
+                        )
+                        for player in lineup.players
+                    ],
+                )
+                for lineup in exc.lineups
+            ]
+            player_usage = _calculate_player_usage(lineups_payload)
+            usage_lookup_mapping = {item.player_id: item.exposure for item in player_usage}
+            success = f"Partial run saved with ID {run_id}"
+            result = {
+                "run_id": run_id,
+                "lineup": lineups_payload[0],
+                "usage_lookup": usage_lookup_mapping,
+                "min_salary": min_salary,
+            }
         finally:
             proj_path.unlink(missing_ok=True)
             if players_path:
                 players_path.unlink(missing_ok=True)
+
+        if redirect_url:
+            return RedirectResponse(url=redirect_url, status_code=303)
 
         runs = store.list_runs(limit=20)
         content = _render_index_page(
@@ -934,6 +1457,14 @@ def create_app() -> FastAPI:
             players_mapping=parsed_players_mapping,
             projection_mapping=parsed_projection_mapping,
             lineups_count=lineups,
+            parallel_jobs=parallel_jobs,
+            perturbation_value=perturbation,
+            max_exposure_value=max_exposure,
+            lineups_per_job_value=lineups_per_job,
+            max_repeating_players_value=max_repeating_players,
+            site_value=site,
+            sport_value=sport,
+            min_salary_value=min_salary,
         )
         return HTMLResponse(content)
 

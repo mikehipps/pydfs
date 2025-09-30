@@ -1343,7 +1343,10 @@ def create_app() -> FastAPI:
         redirect_url: str | None = None
 
         partial_message: str | None = None
+        lineups_payload: list[LineupResponse] | None = None
+        player_usage: list[PlayerUsageResponse] | None = None
         run_id = uuid4().hex
+        job_created = False
         try:
             records, report = merge_player_and_projection_files(
                 players_path=players_path,
@@ -1358,6 +1361,13 @@ def create_app() -> FastAPI:
                 preview = report
                 success = "Preview generated. Review report below."
             else:
+                store.create_job(
+                    run_id=run_id,
+                    site=site,
+                    sport=sport,
+                    state="running",
+                )
+                job_created = True
                 built_lineups = build_lineups(
                     records,
                     site=site,
@@ -1405,6 +1415,8 @@ def create_app() -> FastAPI:
                 redirect_url = f"/ui/runs/{run_id}"
 
         except ValueError as exc:
+            if job_created:
+                store.update_job_state(run_id, state="failed", message=str(exc))
             error = str(exc)
         except LineupGenerationPartial as exc:
             partial_message = exc.message
@@ -1439,10 +1451,38 @@ def create_app() -> FastAPI:
                 "usage_lookup": usage_lookup_mapping,
                 "min_salary": min_salary,
             }
+            if job_created:
+                store.update_job_state(run_id, state="completed", message=partial_message)
         finally:
             proj_path.unlink(missing_ok=True)
             if players_path:
                 players_path.unlink(missing_ok=True)
+
+        if lineups_payload is not None and player_usage is not None:
+            store.save_run(
+                run_id=run_id,
+                site=site,
+                sport=sport,
+                request={
+                    "lineups": lineups,
+                    "max_repeating_players": max_repeating_players,
+                    "max_exposure": max_exposure,
+                    "lineups_per_job": lineups_per_job,
+                    "site": site,
+                    "sport": sport,
+                    "min_salary": min_salary,
+                },
+                report={
+                    "total_players": report.total_players,
+                    "matched_players": report.matched_players,
+                    "players_missing_projection": report.players_missing_projection,
+                    "unmatched_projection_rows": report.unmatched_projection_rows,
+                },
+                lineups=[lineup.model_dump() for lineup in lineups_payload],
+                players_mapping=parsed_players_mapping,
+                projection_mapping=parsed_projection_mapping,
+            )
+            store.update_job_state(run_id, state="completed", message=partial_message)
 
         if redirect_url:
             return RedirectResponse(url=redirect_url, status_code=303)

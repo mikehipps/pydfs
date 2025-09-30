@@ -147,3 +147,20 @@ async def test_cancel_endpoint(client: AsyncClient):
 
     missing = await client.post("/runs/does-not-exist/cancel")
     assert missing.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_lineup_pool_page(client: AsyncClient):
+    resp = await client.get("/ui/pool")
+    assert resp.status_code == 200
+    assert "Lineup Pool" in resp.text
+    assert "Runs included</th><td>" in resp.text
+    assert "Range: Today" in resp.text
+
+    resp_filtered = await client.get("/ui/pool", params={"site": "FD", "sport": "NFL", "limit": 10})
+    assert resp_filtered.status_code == 200
+    assert "Runs in Pool" in resp_filtered.text
+
+    resp_shortcut = await client.get("/ui/pool/nfl/fd")
+    assert resp_shortcut.status_code == 200
+    assert "Lineup Pool" in resp_shortcut.text

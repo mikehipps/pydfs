@@ -51,3 +51,8 @@ Keep this file updated after each significant change set.
 - **API surface**: `/runs` and `/runs/{id}` now include job metadata, `create_app` exposes the store via `app.state`, and the new `/runs/{id}/cancel` endpoint marks jobs as cancel-requested while returning their status.
 - **Tests**: Expanded API tests to cover job state responses and cancellation flow.
 - **Operational notes**: If uvicorn hangs, `pkill -9 -f "uvicorn pydfs.api:create_app"` followed by killing lingering multiprocessing helpers (`ps -fC python3`) clears the port. Restart command above reloads config. Partial results are saved per batch via `RunStore`; consider future enhancement to persist after each batch for safer cancellation.
+
+## Session Summary (2025-02-11)
+- **Lineup rescoring**: Pooled and run-detail views now normalise legacy records and override every player's baseline projection with the most recent projections (missing players fall back to `0`). Top lineup lists sort strictly by current baselines.
+- **Combined pool UX**: Added `/ui/pool` dashboard defaulting to today's runs (limit 50) with optional "include previous days" toggle, plus quick routes like `/ui/pool/nfl/fd`. Summary table shows range context, run list, and uses the rescored data.
+- **Testing**: Added coverage for the new pool endpoints and verified the default range + shortcut rendering via HTTPX tests.

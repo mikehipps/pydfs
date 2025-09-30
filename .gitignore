@@ -14,3 +14,5 @@ coverage.xml
 .ruff_cache/
 .DS_Store
 src/pydfs/pydfs.sqlite
+.logs/
+uvicorn.log

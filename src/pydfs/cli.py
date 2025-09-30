@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydfs.config_loader import MappingProfile
 from pydfs.ingest import load_records_from_csv, merge_player_and_projection_files
-from pydfs.optimizer import build_lineups
+from pydfs.optimizer import LineupGenerationPartial, build_lineups
 
 
 def _parse_args() -> argparse.Namespace:
@@ -63,6 +63,24 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum players from one team",
+    )
+    parser.add_argument(
+        "--max-exposure",
+        type=float,
+        default=0.5,
+        help="Maximum fraction of lineups any single player can appear in (0-1)",
+    )
+    parser.add_argument(
+        "--lineups-per-job",
+        type=int,
+        default=None,
+        help="Number of lineups each worker batch should attempt (auto if omitted)",
+    )
+    parser.add_argument(
+        "--min-salary",
+        type=int,
+        default=None,
+        help="Minimum salary cap to enforce (default uses site rules)",
     )
     return parser.parse_args()
 
@@ -133,16 +151,31 @@ def main() -> None:
         if args.save_profile:
             MappingProfile(players_mapping, projection_mapping).save(args.save_profile)
             print(f"Saved mapping profile to {args.save_profile}")
-    lineups = build_lineups(
-        records,
-        site=args.site,
-        sport=args.sport,
-        n_lineups=args.lineups,
-        lock_player_ids=args.lock,
-        exclude_player_ids=args.exclude,
-        max_repeating_players=args.max_repeat,
-        max_from_one_team=args.max_team,
-    )
+    max_exposure = max(0.0, min(1.0, args.max_exposure))
+
+    max_exposure = max(0.0, min(1.0, args.max_exposure))
+    lineups_per_job = args.lineups_per_job
+    if lineups_per_job is not None:
+        lineups_per_job = max(1, lineups_per_job)
+
+    try:
+        lineups = build_lineups(
+            records,
+            site=args.site,
+            sport=args.sport,
+            n_lineups=args.lineups,
+            lock_player_ids=args.lock,
+            exclude_player_ids=args.exclude,
+            max_repeating_players=args.max_repeat,
+            max_from_one_team=args.max_team,
+            lineups_per_job=lineups_per_job,
+            max_exposure=max_exposure,
+            min_salary=args.min_salary,
+        )
+        partial_message = None
+    except LineupGenerationPartial as exc:
+        lineups = exc.lineups
+        partial_message = exc.message
 
     with args.output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -150,6 +183,7 @@ def main() -> None:
             "lineup_id",
             "salary",
             "projection",
+            "baseline_projection",
             "player_ids",
             "player_names",
             "teams",
@@ -170,12 +204,16 @@ def main() -> None:
                 lineup.lineup_id,
                 lineup.salary,
                 lineup.projection,
+                lineup.baseline_projection,
                 player_ids,
                 player_names,
                 teams,
                 positions,
                 ownerships,
             ])
+
+    if partial_message:
+        print(f"Lineup generation stopped early: {partial_message}")
 
 
 if __name__ == "__main__":

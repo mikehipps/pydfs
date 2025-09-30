@@ -1,7 +1,7 @@
 """Pydantic models for API I/O."""
 
 from .mapping import MappingPayload, MappingPreviewResponse
-from .lineup import LineupRequest, LineupResponse, LineupPlayerResponse
+from .lineup import LineupRequest, LineupResponse, LineupPlayerResponse, PlayerUsageResponse
 from .batch import LineupBatchResponse
 
 __all__ = [
@@ -10,5 +10,6 @@ __all__ = [
     "LineupRequest",
     "LineupResponse",
     "LineupPlayerResponse",
+    "PlayerUsageResponse",
     "LineupBatchResponse",
 ]

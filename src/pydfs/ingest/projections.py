@@ -77,6 +77,8 @@ class ProjectionRow(BaseModel):
     raw_salary: str
     raw_projection: str
     ownership: float | None = Field(default=None, ge=0.0)
+    raw_injury_status: Optional[str] = None
+    raw_probable_pitcher: Optional[str] = None
 
     @classmethod
     def from_mapping(cls, row: Mapping[str, str], mapping: Mapping[str, str]) -> "ProjectionRow":
@@ -116,6 +118,8 @@ class ProjectionRow(BaseModel):
             "raw_salary": extract(parse_spec("salary", "salary"), default="0"),
             "raw_projection": extract(parse_spec("projection", "projection"), default="0"),
             "ownership": ownership_value,
+            "raw_injury_status": extract(parse_spec("injury_status")),
+            "raw_probable_pitcher": extract(parse_spec("probable_pitcher")),
         }
         return cls(**data)
 
@@ -137,6 +141,8 @@ DEFAULT_PLAYERS_MAPPING = {
     "position": "Position",
     "salary": "Salary",
     "projection": "FPPG",
+    "injury_status": "Injury Indicator",
+    "probable_pitcher": "Probable Pitcher",
 }
 
 
@@ -173,7 +179,24 @@ def _parse_projection(raw_projection: str) -> float:
     text = raw_projection.strip()
     if not text:
         return 0.0
-    return float(text)
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"projection '{raw_projection}' is not numeric") from None
+    return max(0.0, value)
+
+
+def _parse_flag(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "t", "yes", "y", "probable", "p"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    return None
 
 
 def _canonical_positions(site: str, sport: str, position: Optional[str]) -> List[str]:
@@ -206,6 +229,13 @@ def rows_to_records(
         metadata = {}
         if row.ownership is not None:
             metadata["projected_ownership"] = row.ownership
+        projection_value = _parse_projection(row.raw_projection)
+        metadata.setdefault("baseline_projection", projection_value)
+        if row.raw_injury_status:
+            metadata["injury_status"] = row.raw_injury_status.strip()
+        flag = _parse_flag(row.raw_probable_pitcher)
+        if flag is not None:
+            metadata["probable_pitcher"] = flag
         team_abbrev = _canonical_team(row.raw_team, sport) if row.raw_team else ""
         records.append(
             PlayerRecord(
@@ -214,7 +244,7 @@ def rows_to_records(
                 team=team_abbrev,
                 positions=positions,
                 salary=_parse_salary(row.raw_salary),
-                projection=_parse_projection(row.raw_projection),
+                projection=projection_value,
                 metadata=metadata,
             )
         )
@@ -280,6 +310,7 @@ def merge_player_and_projection_files(
         return list(base_records.values()), report
 
     overlay_rows = load_projection_csv(projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING)
+    overlay_created_keys: set[str] = set()
     for row in overlay_rows:
         team_abbrev = _canonical_team(row.raw_team, sport)
         positions = _canonical_positions(site, sport, row.raw_position)
@@ -290,6 +321,13 @@ def merge_player_and_projection_files(
             metadata = {}
             if row.ownership is not None:
                 metadata["projected_ownership"] = row.ownership
+            projection_value = _parse_projection(row.raw_projection)
+            metadata.setdefault("baseline_projection", projection_value)
+            if row.raw_injury_status:
+                metadata["injury_status"] = row.raw_injury_status.strip()
+            flag = _parse_flag(row.raw_probable_pitcher)
+            if flag is not None:
+                metadata["probable_pitcher"] = flag
             try:
                 base_records[key] = PlayerRecord(
                     player_id=row.raw_id or row.raw_name,
@@ -297,12 +335,13 @@ def merge_player_and_projection_files(
                     team=team_abbrev,
                     positions=positions,
                     salary=_parse_salary(row.raw_salary),
-                    projection=_parse_projection(row.raw_projection),
+                    projection=projection_value,
                     metadata=metadata,
                 )
             except ValueError:
                 unmatched_projection_rows.append(row.raw_name)
                 continue
+            overlay_created_keys.add(key)
             continue
 
         existing = base_records[key]
@@ -310,9 +349,13 @@ def merge_player_and_projection_files(
         metadata = dict(existing.metadata)
         if row.ownership is not None:
             metadata["projected_ownership"] = row.ownership
-
+        projection_value = _parse_projection(row.raw_projection)
+        metadata["baseline_projection"] = projection_value
+        flag = _parse_flag(row.raw_probable_pitcher)
+        if flag is not None:
+            metadata["probable_pitcher"] = flag
         update = {
-            "projection": _parse_projection(row.raw_projection),
+            "projection": projection_value,
             "salary": _parse_salary(row.raw_salary, default=existing.salary),
             "metadata": metadata,
         }
@@ -331,13 +374,30 @@ def merge_player_and_projection_files(
         if key not in matched_keys
     ]
 
+    sport_upper = sport.upper()
+    filtered_records: List[PlayerRecord] = []
+    filtered_matched = 0
+    for key, record in base_records.items():
+        if projections_path and key not in matched_keys and key not in overlay_created_keys:
+            continue
+        injury_status = str(record.metadata.get("injury_status", "")).strip().lower()
+        if injury_status in {"out", "o", "inj", "injured", "ir", "il"}:
+            continue
+        if sport_upper == "MLB" and any(pos.startswith("P") for pos in record.positions):
+            probable_flag = record.metadata.get("probable_pitcher")
+            if probable_flag is False:
+                continue
+        if key in matched_keys or key in overlay_created_keys:
+            filtered_matched += 1
+        filtered_records.append(record)
+
     report = MergeReport(
-        total_players=len(base_records),
-        matched_players=len(matched_keys),
+        total_players=len(filtered_records),
+        matched_players=filtered_matched,
         players_missing_projection=missing_projection,
         unmatched_projection_rows=unmatched_projection_rows,
     )
-    return list(base_records.values()), report
+    return filtered_records, report
 
 
 @dataclass(frozen=True)

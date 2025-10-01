@@ -79,7 +79,7 @@ class ParallelLineupJobResult:
 
 class ParallelLineupJobConfig:
     def __init__(self, job_id: int, seed: int, records: list[PlayerRecord],
-                 site: str, sport: str, n_lineups: int, perturbation: float,
+                 site: str, sport: str, n_lineups: int, perturbation_p25: float, perturbation_p75: float,
                  max_repeating_players: Optional[int], max_from_one_team: Optional[int],
                  lock_player_ids: Optional[Iterable[str]], exclude_player_ids: Optional[Iterable[str]],
                  max_exposure: Optional[float], min_salary: Optional[int]):
@@ -89,7 +89,8 @@ class ParallelLineupJobConfig:
         self.site = site
         self.sport = sport
         self.n_lineups = n_lineups
-        self.perturbation = perturbation
+        self.perturbation_p25 = max(0.0, perturbation_p25)
+        self.perturbation_p75 = max(0.0, perturbation_p75)
         self.max_repeating_players = max_repeating_players
         self.max_from_one_team = max_from_one_team
         self.lock_player_ids = set(lock_player_ids or []) or None
@@ -305,29 +306,54 @@ def _filter_player_pool(
     return filtered
 
 
-def _perturb_projections(records: Sequence[PlayerRecord], *, seed: int, magnitude: float) -> list[PlayerRecord]:
+def _perturbation_window(percentile: float, pct25: float, pct75: float) -> float:
+    """Return the max fractional perturbation for a given percentile."""
+    if percentile <= 0.25:
+        t = percentile / 0.25 if 0.25 else 0.0
+        return pct25 * (1.5 - 0.5 * t)
+    if percentile >= 0.75:
+        t = (percentile - 0.75) / 0.25 if 0.25 else 0.0
+        return pct75 * (1.0 - 0.5 * t)
+    t = (percentile - 0.25) / 0.5 if 0.5 else 0.0
+    return pct25 + (pct75 - pct25) * t
+
+
+def _perturb_projections(
+    records: Sequence[PlayerRecord],
+    *,
+    seed: int,
+    percentile_25: float,
+    percentile_75: float,
+) -> list[PlayerRecord]:
     """Return a new list of records with projections randomly nudged up/down."""
-    if magnitude <= 0:
+
+    pct25 = max(0.0, percentile_25 / 100.0)
+    pct75 = max(0.0, percentile_75 / 100.0)
+    if max(pct25, pct75) <= 0:
         return list(records)
+
     rng = random.Random(seed)
     players = list(records)
     if not players:
         return []
-    # Sort descending so higher projection players get smaller perturbation windows.
-    players.sort(key=lambda rec: rec.projection, reverse=True)
-    highest = players[0].projection if players else 0.0
-    lowest = players[-1].projection if players else 0.0
-    spread = max(highest - lowest, 1e-6)
+
+    indexed_players = list(enumerate(players))
+    sorted_pairs = sorted(indexed_players, key=lambda item: item[1].projection)
+    max_rank = max(len(players) - 1, 1)
+
+    perturbation_windows: dict[int, float] = {}
+    for rank, (original_index, player) in enumerate(sorted_pairs):
+        percentile = rank / max_rank
+        perturbation_windows[original_index] = max(0.0, _perturbation_window(percentile, pct25, pct75))
 
     cloned: list[PlayerRecord] = []
     for idx, player in enumerate(players):
-        # Normalized rank (0 = highest projection, 1 = lowest).
-        relative_rank = idx / max(len(players) - 1, 1)
-        # Invert so high projections get smaller magnitude, low projections get larger.
-        weight = 1.0 - 0.5 * (1.0 - relative_rank)
-        weighted_magnitude = magnitude * weight
-        # Symmetric perturbation around the original value.
-        offset = rng.uniform(-weighted_magnitude, weighted_magnitude)
+        magnitude = perturbation_windows.get(idx, 0.0)
+        if magnitude <= 0.0:
+            cloned.append(player.model_copy())
+            continue
+        offset = rng.uniform(-magnitude, magnitude)
+        offset = max(-0.99, min(0.99, offset))
         new_projection = max(0.0, player.projection * (1.0 + offset))
         cloned.append(player.model_copy(update={"projection": new_projection}))
     return cloned
@@ -338,7 +364,7 @@ def _lineup_signature(lineup: LineupResult) -> tuple[str, ...]:
 
 
 def _run_parallel_job(config: "ParallelLineupJobConfig") -> ParallelLineupJobResult:
-    perturbed = _perturb_projections(config.records, seed=config.seed, magnitude=config.perturbation)
+    perturbed = _perturb_projections(config.records, seed=config.seed, percentile_25=config.perturbation_p25, percentile_75=config.perturbation_p75)
     try:
         lineups = _build_lineups_serial(
             perturbed,
@@ -376,7 +402,9 @@ def generate_lineups_parallel(
     exclude_player_ids: Optional[Iterable[str]] = None,
     workers: int = 2,
     lineups_per_job: Optional[int] = None,
-    perturbation: float = 0.02,
+    perturbation: float | None = None,
+    perturbation_p25: float | None = None,
+    perturbation_p75: float | None = None,
     max_exposure: Optional[float] = None,
     min_salary: Optional[int] = None,
 ) -> List[LineupResult]:
@@ -385,6 +413,20 @@ def generate_lineups_parallel(
     total_lineups = max(0, total_lineups)
     if total_lineups == 0:
         return []
+
+    # Backwards compatibility: single perturbation value acts as both percentile bounds.
+    base = perturbation if perturbation is not None else 0.0
+    base = max(0.0, base)
+    if base <= 1.0:
+        base_pct = base * 100.0
+    else:
+        base_pct = base
+    p25_value = perturbation_p25 if perturbation_p25 is not None else base_pct
+    if p25_value <= 1.0:
+        p25_value *= 100.0
+    p75_value = perturbation_p75 if perturbation_p75 is not None else p25_value
+    if p75_value <= 1.0:
+        p75_value *= 100.0
 
     workers = max(1, workers)
     records_list = list(records)
@@ -409,11 +451,12 @@ def generate_lineups_parallel(
     run_start = time.perf_counter()
 
     logger.info(
-        "Starting lineup generation – total=%s, workers=%s, per_job=%s, perturbation=%.3f, max_exposure=%s",
+        "Starting lineup generation – total=%s, workers=%s, per_job=%s, perturbation_p25=%.1f%%, perturbation_p75=%.1f%%, max_exposure=%s",
         total_lineups,
         workers,
         per_job,
-        perturbation,
+        p25_value,
+        p75_value,
         "auto" if max_exposure is None else f"{max_exposure:.3f}",
     )
 
@@ -429,7 +472,8 @@ def generate_lineups_parallel(
             site=site,
             sport=sport,
             n_lineups=batch,
-            perturbation=perturbation,
+            perturbation_p25=p25_value,
+            perturbation_p75=p75_value,
             max_repeating_players=max_repeating_players,
             max_from_one_team=max_from_one_team,
             lock_player_ids=lock_player_ids,
@@ -714,7 +758,9 @@ def build_lineups(
     lock_player_ids: Optional[Iterable[str]] = None,
     exclude_player_ids: Optional[Iterable[str]] = None,
     parallel_jobs: int = 1,
-    perturbation: float = 0.0,
+    perturbation: float | None = None,
+    perturbation_p25: float | None = None,
+    perturbation_p75: float | None = None,
     lineups_per_job: int | None = None,
     max_exposure: Optional[float] = 0.5,
     min_salary: Optional[int] = None,
@@ -726,10 +772,18 @@ def build_lineups(
     if per_job is None and n_lineups > 50:
         per_job = min(50, n_lineups)
 
+    base = perturbation if perturbation is not None else 0.0
+    base_pct = base * 100.0 if base <= 1.0 else base
+    p25_value = perturbation_p25 if perturbation_p25 is not None else base_pct
+    p25_value = p25_value * 100.0 if p25_value <= 1.0 else p25_value
+    p75_value = perturbation_p75 if perturbation_p75 is not None else p25_value
+    p75_value = p75_value * 100.0 if p75_value <= 1.0 else p75_value
+
     use_parallel = (
         workers > 1
         or (per_job is not None and per_job < n_lineups)
-        or perturbation > 0.0
+        or p25_value > 0.0
+        or p75_value > 0.0
     )
 
     try:
@@ -758,7 +812,8 @@ def build_lineups(
             exclude_player_ids=exclude_player_ids,
             workers=workers,
             lineups_per_job=per_job,
-            perturbation=perturbation,
+            perturbation_p25=p25_value,
+            perturbation_p75=p75_value,
             max_exposure=max_exposure,
             min_salary=min_salary,
         )

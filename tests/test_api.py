@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from uuid import uuid4
@@ -105,6 +107,8 @@ async def test_lineups_endpoint(client: AsyncClient):
     assert detail["sport"] == "NFL"
     assert detail["state"] == "completed"
     assert detail["job"] is not None
+    assert detail["request"]["perturbation_p25"] == pytest.approx(0.0)
+    assert detail["request"]["perturbation_p75"] == pytest.approx(0.0)
 
     resp = await client.post(f"/runs/{run_id}/rerun")
     assert resp.status_code == 200
@@ -141,6 +145,32 @@ async def test_lineups_with_stored_slate(client: AsyncClient):
     second_payload = resp2.json()
     assert second_payload["slate_id"] == slate_id
     assert len(second_payload["lineups"]) == 1
+
+
+@pytest.mark.anyio
+async def test_lineups_with_custom_perturbation_ranges(client: AsyncClient):
+    files = {
+        "projections": ("projections.csv", _sample_projections(), "text/csv"),
+        "players": ("players.csv", _sample_players(), "text/csv"),
+    }
+    request_payload = {
+        "lineups": 1,
+        "perturbation_p25": 40,
+        "perturbation_p75": 10,
+    }
+    data = {
+        "lineup_request": json.dumps(request_payload),
+        "projection_mapping": "{\"name\": \"player\", \"team\": \"team\", \"salary\": \"salary\", \"projection\": \"fantasy\", \"ownership\": \"proj_own\"}",
+    }
+    resp = await client.post("/lineups", files=files, data=data)
+    resp.raise_for_status()
+    run_id = resp.json()["run_id"]
+
+    detail_resp = await client.get(f"/runs/{run_id}")
+    detail_resp.raise_for_status()
+    detail = detail_resp.json()
+    assert detail["request"]["perturbation_p25"] == pytest.approx(40.0)
+    assert detail["request"]["perturbation_p75"] == pytest.approx(10.0)
 
 
 @pytest.mark.anyio

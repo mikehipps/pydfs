@@ -1,5 +1,10 @@
+import random
+
+import pytest
+
 from pydfs.models import PlayerRecord
 from pydfs.optimizer import build_lineups
+from pydfs.optimizer.service import _perturb_projections, _perturbation_window
 
 
 def _sample_pool() -> list[PlayerRecord]:
@@ -57,3 +62,49 @@ def test_build_lineups_respects_locks_and_excludes():
     ids = {player.player_id for player in lineup.players}
     assert "p1" not in ids
     assert "p2" in ids
+
+
+def test_perturbation_window_shapes_variance():
+    low = _perturbation_window(0.25, 0.4, 0.1)
+    assert pytest.approx(low, rel=1e-6) == 0.4
+
+    bottom = _perturbation_window(0.0, 0.4, 0.1)
+    assert pytest.approx(bottom, rel=1e-6) == 0.4 * 1.5
+
+    mid = _perturbation_window(0.5, 0.4, 0.1)
+    assert pytest.approx(mid, rel=1e-6) == 0.25
+
+    top = _perturbation_window(0.75, 0.4, 0.1)
+    assert pytest.approx(top, rel=1e-6) == 0.1
+
+    summit = _perturbation_window(1.0, 0.4, 0.1)
+    assert pytest.approx(summit, rel=1e-6) == 0.1 * 0.5
+
+
+def test_perturb_projections_respects_percentiles():
+    records = [
+        PlayerRecord(player_id=f"p{i}", name=f"Player {i}", team="TEAM", positions=["UTIL"], salary=5000 + i, projection=float(i))
+        for i in range(1, 6)
+    ]
+
+    perturbed = _perturb_projections(records, seed=17, percentile_25=40.0, percentile_75=10.0)
+    assert len(perturbed) == len(records)
+
+    rng = random.Random(17)
+    indexed = list(enumerate(records))
+    sorted_pairs = sorted(indexed, key=lambda item: item[1].projection)
+    max_rank = max(len(records) - 1, 1)
+    expected_windows = {}
+    for rank, (original_index, player) in enumerate(sorted_pairs):
+        percentile = rank / max_rank
+        expected_windows[original_index] = _perturbation_window(percentile, 0.4, 0.1)
+
+    for idx, (original, updated) in enumerate(zip(records, perturbed)):
+        window = expected_windows[idx]
+        if window <= 0:
+            assert pytest.approx(updated.projection, rel=1e-9) == original.projection
+            continue
+        expected_offset = rng.uniform(-window, window)
+        expected_offset = max(-0.99, min(0.99, expected_offset))
+        actual_offset = (updated.projection / original.projection) - 1.0
+        assert pytest.approx(actual_offset, rel=1e-9) == expected_offset

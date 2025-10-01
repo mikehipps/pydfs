@@ -82,6 +82,26 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Minimum salary cap to enforce (default uses site rules)",
     )
+    parser.add_argument(
+        "--perturbation",
+        type=float,
+        default=None,
+        help="Legacy perturbation amount applied across all players (accepts 0-1 fraction or 0-100 percent)",
+    )
+    parser.add_argument(
+        "--perturbation-p25",
+        dest="perturbation_p25",
+        type=float,
+        default=None,
+        help="Maximum perturbation at the 25th percentile projection (fraction 0-1 or percent 0-100)",
+    )
+    parser.add_argument(
+        "--perturbation-p75",
+        dest="perturbation_p75",
+        type=float,
+        default=None,
+        help="Maximum perturbation at the 75th percentile projection (fraction 0-1 or percent 0-100)",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +188,9 @@ def main() -> None:
             exclude_player_ids=args.exclude,
             max_repeating_players=args.max_repeat,
             max_from_one_team=args.max_team,
+            perturbation=args.perturbation,
+            perturbation_p25=args.perturbation_p25,
+            perturbation_p75=args.perturbation_p75,
             lineups_per_job=lineups_per_job,
             max_exposure=max_exposure,
             min_salary=args.min_salary,

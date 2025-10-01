@@ -424,7 +424,8 @@ def _render_index_page(
     projection_mapping: dict[str, str],
     lineups_count: int,
     parallel_jobs: int,
-    perturbation_value: float,
+    perturbation_p25_value: float,
+    perturbation_p75_value: float,
     max_exposure_value: float,
     lineups_per_job_value: int | None,
     max_repeating_players_value: int | None,
@@ -538,8 +539,11 @@ def _render_index_page(
         <label>Parallel workers</label>
         <input type=\"number\" name=\"parallel_jobs\" min=\"1\" max=\"16\" value=\"{parallel_jobs}\">
 
-        <label>Projection perturbation (0-0.10)</label>
-        <input type=\"number\" name=\"perturbation\" min=\"0\" max=\"0.1\" step=\"0.005\" value=\"{perturbation_value:.3f}\">
+        <label>Perturbation at 25th percentile (%)</label>
+        <input type=\"number\" name=\"perturbation_p25\" min=\"0\" max=\"100\" step=\"1\" value=\"{perturbation_p25_value:.1f}\">
+
+        <label>Perturbation at 75th percentile (%)</label>
+        <input type=\"number\" name=\"perturbation_p75\" min=\"0\" max=\"100\" step=\"1\" value=\"{perturbation_p75_value:.1f}\">
 
         <label>Max player exposure (0-1)</label>
         <input type=\"number\" name=\"max_exposure\" min=\"0\" max=\"1\" step=\"0.05\" value=\"{max_exposure_value:.2f}\">
@@ -1355,6 +1359,8 @@ def create_app() -> FastAPI:
         players_mapping: str | None = Form(None),
         parallel_jobs: int = Form(1),
         perturbation: float = Form(0.0),
+        perturbation_p25_form: float | None = Form(None, alias="perturbation_p25"),
+        perturbation_p75_form: float | None = Form(None, alias="perturbation_p75"),
         max_exposure: float = Form(0.5),
         lineups_per_job: int | None = Form(None),
         max_repeating_players_form: int | None = Form(None),
@@ -1377,8 +1383,24 @@ def create_app() -> FastAPI:
         parsed_projection_mapping = _parse_mapping(projection_mapping) or {}
         if request.parallel_jobs is not None:
             parallel_jobs = request.parallel_jobs
-        if request.perturbation is not None:
-            perturbation = request.perturbation
+
+        base_perturb_input = request.perturbation if request.perturbation is not None else perturbation
+        if base_perturb_input is None:
+            base_pct = 0.0
+        else:
+            base_pct = base_perturb_input * 100.0 if base_perturb_input <= 1.0 else base_perturb_input
+
+        p25_source = request.perturbation_p25 if request.perturbation_p25 is not None else perturbation_p25_form
+        if p25_source is None:
+            perturbation_p25 = max(0.0, base_pct)
+        else:
+            perturbation_p25 = max(0.0, p25_source * 100.0 if p25_source <= 1.0 else p25_source)
+
+        p75_source = request.perturbation_p75 if request.perturbation_p75 is not None else perturbation_p75_form
+        if p75_source is None:
+            perturbation_p75 = max(0.0, perturbation_p25)
+        else:
+            perturbation_p75 = max(0.0, p75_source * 100.0 if p75_source <= 1.0 else p75_source)
         if request.max_exposure is not None:
             max_exposure = request.max_exposure
         site = raw_request.get("site") or site_form
@@ -1409,7 +1431,8 @@ def create_app() -> FastAPI:
             max_repeating_players = max_repeating_players_form
         lineups_per_job = request.lineups_per_job if request.lineups_per_job is not None else lineups_per_job
         parallel_jobs = max(1, parallel_jobs)
-        perturbation = max(0.0, min(0.1, perturbation))
+        perturbation_p25 = max(0.0, perturbation_p25)
+        perturbation_p75 = max(0.0, perturbation_p75)
         max_exposure = max(0.0, min(1.0, max_exposure))
         if lineups_per_job is not None:
             lineups_per_job = max(1, min(1000, lineups_per_job))
@@ -1447,7 +1470,8 @@ def create_app() -> FastAPI:
                 max_repeating_players=max_repeating_players,
                 max_from_one_team=request.max_from_one_team,
                 parallel_jobs=parallel_jobs,
-                perturbation=perturbation,
+                perturbation_p25=perturbation_p25,
+                perturbation_p75=perturbation_p75,
                 lineups_per_job=lineups_per_job,
                 max_exposure=max_exposure,
                 min_salary=min_salary,
@@ -1509,6 +1533,8 @@ def create_app() -> FastAPI:
                 "site": site,
                 "sport": sport,
                 "min_salary": min_salary,
+                "perturbation_p25": perturbation_p25,
+                "perturbation_p75": perturbation_p75,
             },
             report=mapping_report.model_dump(),
             lineups=[lineup.model_dump() for lineup in lineups_payload],
@@ -1683,7 +1709,8 @@ def create_app() -> FastAPI:
             projection_mapping=default_projection_mapping.copy(),
             lineups_count=20,
             parallel_jobs=1,
-            perturbation_value=0.0,
+            perturbation_p25_value=40.0,
+            perturbation_p75_value=10.0,
             max_exposure_value=0.5,
             lineups_per_job_value=None,
             max_repeating_players_value=None,
@@ -1839,6 +1866,8 @@ def create_app() -> FastAPI:
         max_repeating_players: int | None = Form(None),
         parallel_jobs: int = Form(1),
         perturbation: float = Form(0.0),
+        perturbation_p25_form: float | None = Form(None, alias="perturbation_p25"),
+        perturbation_p75_form: float | None = Form(None, alias="perturbation_p75"),
         max_exposure: float = Form(0.5),
         lineups_per_job: int | None = Form(None),
         site: str = Form("FD"),
@@ -1850,8 +1879,26 @@ def create_app() -> FastAPI:
         parsed_players_mapping = _parse_mapping(players_mapping) or DEFAULT_PLAYERS_MAPPING.copy()
         parsed_projection_mapping = _parse_mapping(projection_mapping) or DEFAULT_PROJECTION_MAPPING.copy()
 
+        def _normalize_percentage(value: float | None) -> float | None:
+            if value is None:
+                return None
+            return value * 100.0 if value <= 1.0 else value
+
+        base_pct_value = _normalize_percentage(perturbation)
+        p25_normalized = _normalize_percentage(perturbation_p25_form)
+        if p25_normalized is None:
+            perturbation_p25 = max(0.0, base_pct_value or 0.0)
+        else:
+            perturbation_p25 = max(0.0, p25_normalized)
+
+        p75_normalized = _normalize_percentage(perturbation_p75_form)
+        if p75_normalized is None:
+            fallback = perturbation_p25 if perturbation_p25 > 0.0 else (base_pct_value or 0.0)
+            perturbation_p75 = max(0.0, fallback)
+        else:
+            perturbation_p75 = max(0.0, p75_normalized)
+
         parallel_jobs = max(1, parallel_jobs)
-        perturbation = max(0.0, min(0.1, perturbation))
         max_exposure = max(0.0, min(1.0, max_exposure))
         if lineups_per_job is not None:
             lineups_per_job = max(1, min(1000, lineups_per_job))
@@ -1916,7 +1963,8 @@ def create_app() -> FastAPI:
                         lock_player_ids=None,
                         exclude_player_ids=None,
                         parallel_jobs=parallel_jobs,
-                        perturbation=perturbation,
+                        perturbation_p25=perturbation_p25,
+                        perturbation_p75=perturbation_p75,
                         lineups_per_job=lineups_per_job,
                         max_exposure=max_exposure,
                         min_salary=min_salary,
@@ -1968,6 +2016,8 @@ def create_app() -> FastAPI:
                         "site": site,
                         "sport": sport,
                         "min_salary": min_salary,
+                        "perturbation_p25": perturbation_p25,
+                        "perturbation_p75": perturbation_p75,
                     },
                     report=mapping_report.model_dump(),
                     lineups=[lineup.model_dump() for lineup in lineups_payload],
@@ -2048,7 +2098,8 @@ def create_app() -> FastAPI:
             projection_mapping=parsed_projection_mapping,
             lineups_count=lineups,
             parallel_jobs=parallel_jobs,
-            perturbation_value=perturbation,
+            perturbation_p25_value=perturbation_p25,
+            perturbation_p75_value=perturbation_p75,
             max_exposure_value=max_exposure,
             lineups_per_job_value=lineups_per_job,
             max_repeating_players_value=max_repeating_players,
@@ -2060,6 +2111,7 @@ def create_app() -> FastAPI:
             slate_name_value=slate_name,
         )
         return HTMLResponse(content)
+
     @app.get("/ui/runs/{run_id}", response_class=HTMLResponse)
     async def ui_run_detail(request: Request, run_id: str):
         run = _fetch_run_or_404(run_id)

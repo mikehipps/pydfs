@@ -31,6 +31,9 @@ def main() -> None:
     parser.add_argument("--get-run", metavar="RUN_ID", help="Fetch a specific run and exit")
     parser.add_argument("--export-run", metavar="RUN_ID", help="Download lineup CSV for a run")
     parser.add_argument("--export-path", type=Path, help="Destination path for exported CSV")
+    parser.add_argument("--perturbation", type=float, default=None, help="Legacy perturbation value (fraction or percent)")
+    parser.add_argument("--perturbation-p25", dest="perturbation_p25", type=float, default=None, help="Perturbation cap at 25th percentile (fraction or percent)")
+    parser.add_argument("--perturbation-p75", dest="perturbation_p75", type=float, default=None, help="Perturbation cap at 75th percentile (fraction or percent)")
     args = parser.parse_args()
 
     if args.list_runs or args.get_run or args.export_run:
@@ -81,6 +84,12 @@ def main() -> None:
             return
 
         lineup_request = {"lineups": args.lineups}
+        if args.perturbation is not None:
+            lineup_request["perturbation"] = args.perturbation
+        if args.perturbation_p25 is not None:
+            lineup_request["perturbation_p25"] = args.perturbation_p25
+        if args.perturbation_p75 is not None:
+            lineup_request["perturbation_p75"] = args.perturbation_p75
         data["lineup_request"] = json.dumps(lineup_request)
         resp = client.post("/lineups", files=make_files(), data=data)
         resp.raise_for_status()

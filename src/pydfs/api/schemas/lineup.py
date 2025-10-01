@@ -33,7 +33,9 @@ class LineupRequest(BaseModel):
     max_repeating_players: int | None = None
     max_from_one_team: int | None = None
     parallel_jobs: int | None = Field(default=None, ge=1, le=32)
-    perturbation: float | None = Field(default=None, ge=0.0, le=0.1)
+    perturbation: float | None = Field(default=None, ge=0.0, le=100.0)
+    perturbation_p25: float | None = Field(default=None, ge=0.0, le=100.0)
+    perturbation_p75: float | None = Field(default=None, ge=0.0, le=100.0)
     max_exposure: float | None = Field(default=0.5, ge=0.0, le=1.0)
     lineups_per_job: int | None = Field(default=None, ge=1, le=500)
     min_salary: int | None = Field(default=None, ge=0)

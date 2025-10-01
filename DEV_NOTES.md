@@ -56,3 +56,4 @@ Keep this file updated after each significant change set.
 - **Lineup rescoring**: Pooled and run-detail views now normalise legacy records and override every player's baseline projection with the most recent projections (missing players fall back to `0`). Top lineup lists sort strictly by current baselines.
 - **Combined pool UX**: Added `/ui/pool` dashboard defaulting to today's runs (limit 50) with optional "include previous days" toggle, plus quick routes like `/ui/pool/nfl/fd`. Summary table shows range context, run list, and uses the rescored data.
 - **Testing**: Added coverage for the new pool endpoints and verified the default range + shortcut rendering via HTTPX tests.
+- **Slate persistence**: Introduced a `slates` store capturing raw player/projection CSVs, mappings, and parsed records. API/UI runs can now reuse the latest (or selected) slate without re-uploading files, and responses include the associated `slate_id` for easy follow-up runs.

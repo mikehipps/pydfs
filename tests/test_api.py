@@ -89,6 +89,7 @@ async def test_lineups_endpoint(client: AsyncClient):
     assert len(lineup["players"]) == 9
     # Ownership should be parsed through mapping
     assert lineup["players"][0]["ownership"] is not None
+    assert payload.get("slate_id")
 
     run_id = payload["run_id"]
     resp = await client.get("/runs")
@@ -110,6 +111,36 @@ async def test_lineups_endpoint(client: AsyncClient):
     rerun_payload = resp.json()
     assert rerun_payload["run_id"] == run_id
     assert rerun_payload["lineups"], "Stored lineups should be returned"
+
+
+@pytest.mark.anyio
+async def test_lineups_with_stored_slate(client: AsyncClient):
+    files = {
+        "projections": ("projections.csv", _sample_projections(), "text/csv"),
+        "players": ("players.csv", _sample_players(), "text/csv"),
+    }
+    data = {
+        "lineup_request": "{\"lineups\": 1}",
+        "projection_mapping": "{\"name\": \"player\", \"team\": \"team\", \"salary\": \"salary\", \"projection\": \"fantasy\", \"ownership\": \"proj_own\"}",
+    }
+    resp = await client.post("/lineups", files=files, data=data)
+    resp.raise_for_status()
+    first_payload = resp.json()
+    slate_id = first_payload.get("slate_id")
+    assert slate_id, "First run should store a slate"
+
+    # Re-run without uploading files, using stored slate
+    resp2 = await client.post(
+        "/lineups",
+        data={
+            "lineup_request": "{\"lineups\": 1}",
+            "slate_id": slate_id,
+        },
+    )
+    resp2.raise_for_status()
+    second_payload = resp2.json()
+    assert second_payload["slate_id"] == slate_id
+    assert len(second_payload["lineups"]) == 1
 
 
 @pytest.mark.anyio

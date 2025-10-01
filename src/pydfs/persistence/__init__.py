@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional
+from uuid import uuid4
 
 
 @dataclass
@@ -36,6 +37,24 @@ class RunJob:
     message: Optional[str]
     cancel_requested_at: Optional[datetime]
     completed_at: Optional[datetime]
+
+
+@dataclass
+class SlateRecord:
+    slate_id: str
+    created_at: datetime
+    updated_at: datetime
+    site: str
+    sport: str
+    name: str
+    players_filename: str
+    projections_filename: str
+    players_csv: str
+    projections_csv: str
+    records: List[dict]
+    report: dict
+    players_mapping: dict
+    projection_mapping: dict
 
 
 class RunStore:
@@ -118,6 +137,26 @@ class RunStore:
                 updated_at TEXT NOT NULL,
                 cancel_requested_at TEXT,
                 completed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS slates (
+                id TEXT PRIMARY KEY,
+                site TEXT NOT NULL,
+                sport TEXT NOT NULL,
+                name TEXT,
+                players_filename TEXT NOT NULL,
+                projections_filename TEXT NOT NULL,
+                players_csv TEXT NOT NULL,
+                projections_csv TEXT NOT NULL,
+                records_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                players_mapping_json TEXT NOT NULL,
+                projection_mapping_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -245,6 +284,109 @@ class RunStore:
             ).fetchall()
         return [self._job_row_to_record(row) for row in rows]
 
+    def save_slate(
+        self,
+        *,
+        site: str,
+        sport: str,
+        name: str,
+        players_filename: str,
+        projections_filename: str,
+        players_csv: str,
+        projections_csv: str,
+        records: Iterable[dict],
+        report: dict,
+        players_mapping: dict,
+        projection_mapping: dict,
+        slate_id: Optional[str] = None,
+    ) -> SlateRecord:
+        slate_id = slate_id or uuid4().hex
+        now = datetime.now(timezone.utc)
+        payload = (
+            slate_id,
+            site,
+            sport,
+            name,
+            players_filename,
+            projections_filename,
+            players_csv,
+            projections_csv,
+            json.dumps(list(records)),
+            json.dumps(report),
+            json.dumps(players_mapping),
+            json.dumps(projection_mapping),
+            now.isoformat(),
+            now.isoformat(),
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO slates (
+                    id, site, sport, name, players_filename, projections_filename,
+                    players_csv, projections_csv, records_json, report_json,
+                    players_mapping_json, projection_mapping_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+            conn.commit()
+        slate = self.get_slate(slate_id)
+        if slate is None:  # pragma: no cover
+            raise KeyError(f"Slate {slate_id} not found after insert")
+        return slate
+
+    def get_slate(self, slate_id: Optional[str]) -> Optional[SlateRecord]:
+        if not slate_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM slates WHERE id = ?", (slate_id,)).fetchone()
+            if row is None:
+                return None
+            return self._row_to_slate(row)
+
+    def get_latest_slate(self, *, site: str | None = None, sport: str | None = None) -> Optional[SlateRecord]:
+        query = "SELECT * FROM slates"
+        conditions: list[str] = []
+        params: list[str] = []
+        if site:
+            conditions.append("site = ?")
+            params.append(site)
+        if sport:
+            conditions.append("sport = ?")
+            params.append(sport)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY datetime(updated_at) DESC LIMIT 1"
+        with self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
+            if row is None:
+                return None
+            return self._row_to_slate(row)
+
+    def list_slates(
+        self,
+        *,
+        site: str | None = None,
+        sport: str | None = None,
+        limit: int = 20,
+    ) -> List[SlateRecord]:
+        query = "SELECT * FROM slates"
+        conditions: list[str] = []
+        params: list[str | int] = []
+        if site:
+            conditions.append("site = ?")
+            params.append(site)
+        if sport:
+            conditions.append("sport = ?")
+            params.append(sport)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY datetime(updated_at) DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_slate(row) for row in rows]
+
     def _row_to_record(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
             run_id=row["id"],
@@ -352,3 +494,21 @@ class RunStore:
         if job is None:  # pragma: no cover - defensive, should not happen
             raise KeyError(f"Job {run_id} not found after upsert")
         return job
+
+    def _row_to_slate(self, row: sqlite3.Row) -> SlateRecord:
+        return SlateRecord(
+            slate_id=row["id"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            site=row["site"],
+            sport=row["sport"],
+            name=row["name"] or "",
+            players_filename=row["players_filename"],
+            projections_filename=row["projections_filename"],
+            players_csv=row["players_csv"],
+            projections_csv=row["projections_csv"],
+            records=json.loads(row["records_json"]),
+            report=json.loads(row["report_json"]),
+            players_mapping=json.loads(row["players_mapping_json"]),
+            projection_mapping=json.loads(row["projection_mapping_json"]),
+        )

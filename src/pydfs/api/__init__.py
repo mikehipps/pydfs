@@ -17,6 +17,8 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request, Query
 from fastapi.responses import HTMLResponse, Response, RedirectResponse
 
+from dataclasses import asdict
+
 from pydfs.api.schemas import (
     LineupBatchResponse,
     LineupPlayerResponse,
@@ -26,8 +28,10 @@ from pydfs.api.schemas import (
     PlayerUsageResponse,
 )
 from pydfs.ingest import merge_player_and_projection_files
+from pydfs.ingest.projections import MergeReport
+from pydfs.models import PlayerRecord
 from pydfs.optimizer import LineupGenerationPartial, build_lineups
-from pydfs.persistence import RunJob, RunRecord, RunStore
+from pydfs.persistence import RunJob, RunRecord, RunStore, SlateRecord
 
 
 DEFAULT_PLAYERS_MAPPING = {
@@ -115,6 +119,21 @@ def _calculate_player_usage(lineups: list[LineupResponse]) -> list[PlayerUsageRe
         )
         for player_id, data in sorted_usage
     ]
+
+
+def _report_to_mapping(report: MappingPreviewResponse | MergeReport | dict) -> MappingPreviewResponse:
+    if isinstance(report, MappingPreviewResponse):
+        return report
+    if isinstance(report, MergeReport):
+        return MappingPreviewResponse(
+            total_players=report.total_players,
+            matched_players=report.matched_players,
+            players_missing_projection=report.players_missing_projection,
+            unmatched_projection_rows=report.unmatched_projection_rows,
+        )
+    if isinstance(report, dict):
+        return MappingPreviewResponse.model_validate(report)
+    raise TypeError("Unsupported report type")
 
 
 def _analyze_lineups(
@@ -214,6 +233,16 @@ def _normalize_lineup_dict(lineup_data: dict[str, Any]) -> dict[str, Any]:
         players.append(player_copy)
     normalized["players"] = players
     return normalized
+
+
+def _write_temp_from_bytes(contents: bytes) -> Path:
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    try:
+        tmp.write(contents)
+        tmp.flush()
+    finally:
+        tmp.close()
+    return Path(tmp.name)
 
 
 def _render_top_lineups(
@@ -373,6 +402,9 @@ def _render_page(body: str) -> str:
         .pool-filter select, .pool-filter input {{ margin-top: 0.35rem; padding: 0.4rem; border-radius: 6px; border: 1px solid #cbd5e1; }}
         .pool-filter label.checkbox {{ flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 600; }}
         .pool-filter label.checkbox input {{ margin-top: 0; }}
+        .slate-info {{ margin-bottom: 1.5rem; padding: 1rem; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }}
+        .slate-info ul {{ list-style: none; padding: 0; margin: 0.5rem 0 0; }}
+        .slate-info li {{ margin-bottom: 0.25rem; }}
     </style>
 </head>
 <body>
@@ -399,6 +431,9 @@ def _render_index_page(
     site_value: str,
     sport_value: str,
     min_salary_value: int | None,
+    slates: list[dict[str, Any]],
+    selected_slate_id: str | None,
+    slate_name_value: str | None,
 ) -> str:
     def _mapping_section(
         section_id: str,
@@ -465,13 +500,28 @@ def _render_index_page(
         for sport, label in SPORT_CHOICES
     )
 
+    current_slate = slates[0] if slates else None
+    slate_options_html = "<option value=\"\">Upload new slate</option>" + "".join(
+        f"<option value=\"{escape(str(slate['slate_id']))}\"{' selected' if str(slate['slate_id']) == (selected_slate_id or '') else ''}>{escape(slate['display'])}</option>"
+        for slate in slates
+    )
+
     form_html = f"""
     <form method=\"post\" action=\"/ui\" enctype=\"multipart/form-data\">
+        <label>Stored Slate (optional)</label>
+        <select name=\"slate_id\">{slate_options_html}</select>
+        <small>Select a saved slate or leave blank to upload new files.</small>
+
+        <label>Slate name</label>
+        <input type=\"text\" name=\"slate_name\" value=\"{escape(slate_name_value or '')}\" placeholder=\"e.g. FD NFL Main\">
+
         <label>Players CSV</label>
-        <input type=\"file\" id=\"players-file\" name=\"players\" required>
+        <input type=\"file\" id=\"players-file\" name=\"players\" accept=\".csv,text/csv\">
+        <small>Optional when using a stored slate.</small>
 
         <label>Projections CSV</label>
-        <input type=\"file\" id=\"projections-file\" name=\"projections\" required>
+        <input type=\"file\" id=\"projections-file\" name=\"projections\" accept=\".csv,text/csv\">
+        <small>Optional when using a stored slate.</small>
 
         {players_section}
         {projection_section}
@@ -509,6 +559,20 @@ def _render_index_page(
         </div>
     </form>
     """
+
+    slate_info_html = ""
+    if current_slate:
+        slate_info_html = f"""
+        <section class=\"slate-info\">
+            <h2>Current Slate</h2>
+            <p><strong>{escape(current_slate['display'])}</strong></p>
+            <ul>
+                <li>Players file: {escape(current_slate['players_filename'])}</li>
+                <li>Projections file: {escape(current_slate['projections_filename'])}</li>
+                <li>Uploaded: {current_slate['created_at'].astimezone().strftime('%Y-%m-%d %H:%M:%S')}</li>
+            </ul>
+        </section>
+        """
 
     def _safe_js_object(data: dict[str, str]) -> str:
         json_text = json.dumps(data)
@@ -796,7 +860,7 @@ def _render_index_page(
     </section>
     """
 
-    body = flash_html + form_html + preview_html + result_html + runs_section + mapping_script
+    body = flash_html + slate_info_html + form_html + preview_html + result_html + runs_section + mapping_script
     return _render_page(body)
 
 
@@ -1168,19 +1232,19 @@ def _parse_mapping(mapping_str: str | None) -> dict[str, str]:
         raise HTTPException(status_code=400, detail=f"Invalid mapping JSON: {exc}") from exc
 
 
-async def _write_temp(upload: UploadFile | None) -> Path | None:
+async def _write_temp(upload: UploadFile | None) -> tuple[Path | None, bytes | None]:
     if upload is None:
-        return None
+        return None, None
     contents = await upload.read()
     if not contents:
-        return None
+        return None, None
     tmp = tempfile.NamedTemporaryFile(delete=False)
     try:
         tmp.write(contents)
         tmp.flush()
     finally:
         tmp.close()
-    return Path(tmp.name)
+    return Path(tmp.name), contents
 
 
 def create_app() -> FastAPI:
@@ -1189,6 +1253,19 @@ def create_app() -> FastAPI:
     app.state.run_store = store
     default_players_mapping = DEFAULT_PLAYERS_MAPPING.copy()
     default_projection_mapping = DEFAULT_PROJECTION_MAPPING.copy()
+
+    def slate_to_summary(slate: SlateRecord) -> dict[str, Any]:
+        return {
+            "slate_id": slate.slate_id,
+            "site": slate.site,
+            "sport": slate.sport,
+            "name": slate.name or f"{slate.site} {slate.sport}",
+            "players_filename": slate.players_filename,
+            "projections_filename": slate.projections_filename,
+            "created_at": slate.created_at,
+            "updated_at": slate.updated_at,
+            "display": f"{slate.site} {slate.sport} – {slate.name or 'Unnamed'} ({slate.created_at.astimezone().strftime('%Y-%m-%d %H:%M')})",
+        }
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -1203,8 +1280,8 @@ def create_app() -> FastAPI:
         site: str = Form("FD"),
         sport: str = Form("NFL"),
     ) -> MappingPreviewResponse:
-        proj_path = await _write_temp(projections)
-        players_path = await _write_temp(players)
+        proj_path, projections_bytes = await _write_temp(projections)
+        players_path, players_bytes = await _write_temp(players)
         if proj_path is None:
             raise HTTPException(status_code=400, detail="projections file is empty")
 
@@ -1271,7 +1348,7 @@ def create_app() -> FastAPI:
 
     @app.post("/lineups", response_model=LineupBatchResponse)
     async def build(
-        projections: UploadFile = File(...),
+        projections: UploadFile | None = File(None),
         players: UploadFile | None = File(None),
         lineup_request: str = Form("{}"),
         projection_mapping: str | None = Form(None),
@@ -1284,6 +1361,8 @@ def create_app() -> FastAPI:
         site_form: str = Form("FD"),
         sport_form: str = Form("NFL"),
         min_salary_form: int | None = Form(None),
+        slate_id_form: str | None = Form(None, alias="slate_id"),
+        slate_name_form: str | None = Form(None, alias="slate_name"),
     ) -> LineupBatchResponse:
         try:
             raw_request = json.loads(lineup_request or "{}")
@@ -1291,10 +1370,8 @@ def create_app() -> FastAPI:
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid lineup_request JSON: {exc}") from exc
 
-        proj_path = await _write_temp(projections)
-        players_path = await _write_temp(players)
-        if proj_path is None:
-            raise HTTPException(status_code=400, detail="projections file is empty")
+        proj_path, projections_bytes = await _write_temp(projections)
+        players_path, players_bytes = await _write_temp(players)
 
         parsed_players_mapping = _parse_mapping(players_mapping) or {}
         parsed_projection_mapping = _parse_mapping(projection_mapping) or {}
@@ -1307,6 +1384,23 @@ def create_app() -> FastAPI:
         site = raw_request.get("site") or site_form
         sport = raw_request.get("sport") or sport_form
         min_salary = raw_request.get("min_salary") if raw_request.get("min_salary") is not None else min_salary_form
+        slate_id = slate_id_form.strip() if slate_id_form else None
+        slate_name = slate_name_form.strip() if slate_name_form else None
+
+        slate_inputs = _prepare_slate_inputs(
+            site=site,
+            sport=sport,
+            players_path=players_path,
+            players_bytes=players_bytes,
+            projections_path=proj_path,
+            projections_bytes=projections_bytes,
+            players_mapping=parsed_players_mapping,
+            projection_mapping=parsed_projection_mapping,
+            slate_id=slate_id,
+        )
+
+        site = slate_inputs["resolved_site"]
+        sport = slate_inputs["resolved_sport"]
         request = request.model_copy(update={"site": site, "sport": sport, "min_salary": min_salary})
         site = request.site
         sport = request.sport
@@ -1322,6 +1416,17 @@ def create_app() -> FastAPI:
         if max_repeating_players is not None:
             max_repeating_players = max(0, max_repeating_players)
 
+        records: list[PlayerRecord] = slate_inputs["records"]
+        mapping_report: MappingPreviewResponse = slate_inputs["report"]
+        slate = slate_inputs["slate"]
+        effective_players_mapping = slate_inputs["effective_players_mapping"]
+        effective_projection_mapping = slate_inputs["effective_projection_mapping"]
+        cleanup_paths: list[Path] = slate_inputs["cleanup_paths"]
+        players_path = slate_inputs["players_path"]
+        proj_path = slate_inputs["projections_path"]
+        new_players_uploaded = slate_inputs["new_players_uploaded"]
+        new_projections_uploaded = slate_inputs["new_projections_uploaded"]
+
         run_id = uuid4().hex
         store.create_job(
             run_id=run_id,
@@ -1332,25 +1437,6 @@ def create_app() -> FastAPI:
 
         partial_message: str | None = None
         try:
-            if players_path:
-                records, report = merge_player_and_projection_files(
-                    players_path=players_path,
-                    projections_path=proj_path,
-                    site=site,
-                    sport=sport,
-                    players_mapping=parsed_players_mapping or None,
-                    projection_mapping=parsed_projection_mapping or None,
-                )
-            else:
-                records, report = merge_player_and_projection_files(
-                    players_path=proj_path,
-                    projections_path=None,
-                    site=site,
-                    sport=sport,
-                    players_mapping=parsed_players_mapping or None,
-                    projection_mapping=None,
-                )
-
             lineups = build_lineups(
                 records,
                 site=site,
@@ -1372,13 +1458,18 @@ def create_app() -> FastAPI:
         except LineupGenerationPartial as exc:
             partial_message = exc.message
             lineups = exc.lineups
-        except Exception as exc:  # pragma: no cover - defensive guard for unexpected errors
+        except Exception as exc:  # pragma: no cover
             store.update_job_state(run_id, state="failed", message=str(exc))
             raise
         finally:
-            proj_path.unlink(missing_ok=True)
+            paths_to_cleanup = {path for path in cleanup_paths if path}
+            if proj_path:
+                paths_to_cleanup.add(proj_path)
             if players_path:
-                players_path.unlink(missing_ok=True)
+                paths_to_cleanup.add(players_path)
+            for path in paths_to_cleanup:
+                path.unlink(missing_ok=True)
+
         lineups_payload = [
             LineupResponse(
                 lineup_id=lineup.lineup_id,
@@ -1419,31 +1510,57 @@ def create_app() -> FastAPI:
                 "sport": sport,
                 "min_salary": min_salary,
             },
-            report={
-                "total_players": report.total_players,
-                "matched_players": report.matched_players,
-                "players_missing_projection": report.players_missing_projection,
-                "unmatched_projection_rows": report.unmatched_projection_rows,
-            },
+            report=mapping_report.model_dump(),
             lineups=[lineup.model_dump() for lineup in lineups_payload],
-            players_mapping=parsed_players_mapping,
-            projection_mapping=parsed_projection_mapping,
+            players_mapping=effective_players_mapping,
+            projection_mapping=effective_projection_mapping,
         )
 
         if partial_message:
             store.update_job_state(run_id, state="completed", message=partial_message)
 
+        new_slate = None
+        if new_players_uploaded or new_projections_uploaded:
+            players_csv_text = (
+                players_bytes.decode("utf-8")
+                if new_players_uploaded and players_bytes is not None
+                else (slate.players_csv if slate else "")
+            )
+            projections_csv_text = (
+                projections_bytes.decode("utf-8")
+                if new_projections_uploaded and projections_bytes is not None
+                else (slate.projections_csv if slate else "")
+            )
+            slate_name_to_store = slate_name or (slate.name if slate else f"{site} {sport} Slate")
+            players_filename_to_store = (
+                players.filename if players and players.filename else (slate.players_filename if slate else "players.csv")
+            )
+            projections_filename_to_store = (
+                projections.filename if projections and projections.filename else (slate.projections_filename if slate else "projections.csv")
+            )
+            new_slate = store.save_slate(
+                site=site,
+                sport=sport,
+                name=slate_name_to_store,
+                players_filename=players_filename_to_store,
+                projections_filename=projections_filename_to_store,
+                players_csv=players_csv_text,
+                projections_csv=projections_csv_text,
+                records=[record.model_dump() for record in records],
+                report=mapping_report.model_dump(),
+                players_mapping=effective_players_mapping,
+                projection_mapping=effective_projection_mapping,
+            )
+
+        slate_used = new_slate or slate
+
         response = LineupBatchResponse(
             run_id=run_id,
-            report=MappingPreviewResponse(
-                total_players=report.total_players,
-                matched_players=report.matched_players,
-                players_missing_projection=report.players_missing_projection,
-                unmatched_projection_rows=report.unmatched_projection_rows,
-            ),
+            report=mapping_report,
             lineups=lineups_payload,
             player_usage=player_usage,
             message=partial_message,
+            slate_id=slate_used.slate_id if slate_used else None,
         )
         return response
 
@@ -1555,6 +1672,7 @@ def create_app() -> FastAPI:
     @app.get("/ui", response_class=HTMLResponse)
     async def ui_index(request: Request):
         runs = store.list_runs(limit=20)
+        slates_data = [slate_to_summary(slate) for slate in store.list_slates(limit=20)]
         content = _render_index_page(
             runs=runs,
             preview=None,
@@ -1572,6 +1690,9 @@ def create_app() -> FastAPI:
             site_value="FD",
             sport_value="NFL",
             min_salary_value=None,
+            slates=slates_data,
+            selected_slate_id=None,
+            slate_name_value="",
         )
         return HTMLResponse(content)
 
@@ -1594,6 +1715,85 @@ def create_app() -> FastAPI:
             all_dates=all_dates,
             today=today,
         )
+
+    def _prepare_slate_inputs(
+        *,
+        site: str,
+        sport: str,
+        players_path: Path | None,
+        players_bytes: bytes | None,
+        projections_path: Path | None,
+        projections_bytes: bytes | None,
+        players_mapping: dict[str, str],
+        projection_mapping: dict[str, str],
+        slate_id: str | None,
+    ) -> dict[str, Any]:
+        new_players_uploaded = players_bytes is not None
+        new_projections_uploaded = projections_bytes is not None
+
+        slate: SlateRecord | None = None
+        if slate_id:
+            slate = store.get_slate(slate_id)
+            if slate is None:
+                raise HTTPException(status_code=400, detail="Selected slate not found")
+        if slate is None and (players_path is None or projections_path is None):
+            slate = store.get_latest_slate(site=site, sport=sport)
+
+        if slate is None and (players_path is None or projections_path is None):
+            raise HTTPException(status_code=400, detail="Players and projections files are required when no stored slate is available")
+
+        resolved_site = slate.site if slate and not new_players_uploaded and players_path is None else site
+        resolved_sport = slate.sport if slate and not new_players_uploaded and players_path is None else sport
+
+        effective_players_mapping = dict(players_mapping) if players_mapping else (dict(slate.players_mapping) if slate else {})
+        effective_projection_mapping = dict(projection_mapping) if projection_mapping else (dict(slate.projection_mapping) if slate else {})
+
+        cleanup_paths: list[Path] = []
+        if players_path is None:
+            if slate is None:
+                raise HTTPException(status_code=400, detail="Players file is required")
+            players_path = _write_temp_from_bytes(slate.players_csv.encode("utf-8"))
+            cleanup_paths.append(players_path)
+            if not effective_players_mapping:
+                effective_players_mapping = dict(slate.players_mapping)
+        if projections_path is None:
+            if slate is None:
+                raise HTTPException(status_code=400, detail="Projections file is required")
+            projections_path = _write_temp_from_bytes(slate.projections_csv.encode("utf-8"))
+            cleanup_paths.append(projections_path)
+            if not effective_projection_mapping:
+                effective_projection_mapping = dict(slate.projection_mapping)
+
+        use_cached_records = slate is not None and players_bytes is None and projections_bytes is None and new_players_uploaded is False and new_projections_uploaded is False and players_path in cleanup_paths and projections_path in cleanup_paths
+
+        if use_cached_records and slate is not None:
+            records = [PlayerRecord.model_validate(item) for item in slate.records]
+            report = _report_to_mapping(slate.report)
+        else:
+            records, merge_report = merge_player_and_projection_files(
+                players_path=players_path,
+                projections_path=projections_path,
+                site=resolved_site,
+                sport=resolved_sport,
+                players_mapping=effective_players_mapping or None,
+                projection_mapping=effective_projection_mapping or None,
+            )
+            report = _report_to_mapping(merge_report)
+
+        return {
+            "records": records,
+            "report": report,
+            "slate": slate,
+            "effective_players_mapping": effective_players_mapping,
+            "effective_projection_mapping": effective_projection_mapping,
+            "cleanup_paths": cleanup_paths,
+            "players_path": players_path,
+            "projections_path": projections_path,
+            "new_players_uploaded": new_players_uploaded,
+            "new_projections_uploaded": new_projections_uploaded,
+            "resolved_site": resolved_site,
+            "resolved_sport": resolved_sport,
+        }
 
     @app.get("/ui/pool", response_class=HTMLResponse)
     async def ui_pool(
@@ -1631,8 +1831,8 @@ def create_app() -> FastAPI:
     async def ui_handle(
         request: Request,
         submit_action: str = Form(...),
-        players: UploadFile = File(...),
-        projections: UploadFile = File(...),
+        players: UploadFile | None = File(None),
+        projections: UploadFile | None = File(None),
         players_mapping: str = Form(""),
         projection_mapping: str = Form(""),
         lineups: int = Form(20),
@@ -1644,6 +1844,8 @@ def create_app() -> FastAPI:
         site: str = Form("FD"),
         sport: str = Form("NFL"),
         min_salary: int | None = Form(None),
+        slate_id: str | None = Form(None),
+        slate_name: str | None = Form(None),
     ):
         parsed_players_mapping = _parse_mapping(players_mapping) or DEFAULT_PLAYERS_MAPPING.copy()
         parsed_projection_mapping = _parse_mapping(projection_mapping) or DEFAULT_PROJECTION_MAPPING.copy()
@@ -1656,10 +1858,33 @@ def create_app() -> FastAPI:
         if max_repeating_players is not None:
             max_repeating_players = max(0, max_repeating_players)
 
-        proj_path = await _write_temp(projections)
-        players_path = await _write_temp(players)
-        if proj_path is None or players_path is None:
-            raise HTTPException(status_code=400, detail="Players and projections files are required")
+        proj_path, projections_bytes = await _write_temp(projections)
+        players_path, players_bytes = await _write_temp(players)
+
+        slate_inputs = _prepare_slate_inputs(
+            site=site,
+            sport=sport,
+            players_path=players_path,
+            players_bytes=players_bytes,
+            projections_path=proj_path,
+            projections_bytes=projections_bytes,
+            players_mapping=parsed_players_mapping,
+            projection_mapping=parsed_projection_mapping,
+            slate_id=slate_id.strip() if slate_id else None,
+        )
+
+        site = slate_inputs["resolved_site"]
+        sport = slate_inputs["resolved_sport"]
+        records: list[PlayerRecord] = slate_inputs["records"]
+        mapping_report: MappingPreviewResponse = slate_inputs["report"]
+        slate_obj = slate_inputs["slate"]
+        effective_players_mapping = slate_inputs["effective_players_mapping"]
+        effective_projection_mapping = slate_inputs["effective_projection_mapping"]
+        cleanup_paths: list[Path] = slate_inputs["cleanup_paths"]
+        players_path = slate_inputs["players_path"]
+        proj_path = slate_inputs["projections_path"]
+        new_players_uploaded = slate_inputs["new_players_uploaded"]
+        new_projections_uploaded = slate_inputs["new_projections_uploaded"]
 
         preview = None
         result = None
@@ -1667,43 +1892,45 @@ def create_app() -> FastAPI:
         success = None
         redirect_url: str | None = None
 
-        partial_message: str | None = None
-        lineups_payload: list[LineupResponse] | None = None
-        player_usage: list[PlayerUsageResponse] | None = None
-        run_id = uuid4().hex
-        job_created = False
         try:
-            records, report = merge_player_and_projection_files(
-                players_path=players_path,
-                projections_path=proj_path,
-                site=site,
-                sport=sport,
-                players_mapping=parsed_players_mapping,
-                projection_mapping=parsed_projection_mapping,
-            )
-
             if submit_action == "preview":
-                preview = report
+                preview = mapping_report
                 success = "Preview generated. Review report below."
             else:
+                run_id = uuid4().hex
                 store.create_job(
                     run_id=run_id,
                     site=site,
                     sport=sport,
                     state="running",
                 )
-                job_created = True
-                built_lineups = build_lineups(
-                    records,
-                    site=site,
-                    sport=sport,
-                    n_lineups=lineups,
-                    max_repeating_players=max_repeating_players,
-                    parallel_jobs=parallel_jobs,
-                    perturbation=perturbation,
-                lineups_per_job=lineups_per_job,
-                max_exposure=max_exposure,
-            )
+                partial_message = None
+                try:
+                    built_lineups = build_lineups(
+                        records,
+                        site=site,
+                        sport=sport,
+                        n_lineups=lineups,
+                        max_repeating_players=max_repeating_players,
+                        max_from_one_team=None,
+                        lock_player_ids=None,
+                        exclude_player_ids=None,
+                        parallel_jobs=parallel_jobs,
+                        perturbation=perturbation,
+                        lineups_per_job=lineups_per_job,
+                        max_exposure=max_exposure,
+                        min_salary=min_salary,
+                    )
+                except LineupGenerationPartial as exc:
+                    partial_message = exc.message
+                    built_lineups = exc.lineups
+                    store.update_job_state(run_id, state="completed", message=exc.message)
+                except Exception as exc:
+                    store.update_job_state(run_id, state="failed", message=str(exc))
+                    raise
+                else:
+                    store.update_job_state(run_id, state="completed")
+
                 lineups_payload = [
                     LineupResponse(
                         lineup_id=lineup.lineup_id,
@@ -1729,90 +1956,88 @@ def create_app() -> FastAPI:
                 player_usage = _calculate_player_usage(lineups_payload)
                 usage_lookup_mapping = {item.player_id: item.exposure for item in player_usage}
 
+                store.save_run(
+                    run_id=run_id,
+                    site=site,
+                    sport=sport,
+                    request={
+                        "lineups": lineups,
+                        "max_repeating_players": max_repeating_players,
+                        "max_exposure": max_exposure,
+                        "lineups_per_job": lineups_per_job,
+                        "site": site,
+                        "sport": sport,
+                        "min_salary": min_salary,
+                    },
+                    report=mapping_report.model_dump(),
+                    lineups=[lineup.model_dump() for lineup in lineups_payload],
+                    players_mapping=effective_players_mapping,
+                    projection_mapping=effective_projection_mapping,
+                )
+
+                new_slate = None
+                if new_players_uploaded or new_projections_uploaded:
+                    players_csv_text = (
+                        players_bytes.decode("utf-8")
+                        if new_players_uploaded and players_bytes is not None
+                        else (slate_obj.players_csv if slate_obj else "")
+                    )
+                    projections_csv_text = (
+                        projections_bytes.decode("utf-8")
+                        if new_projections_uploaded and projections_bytes is not None
+                        else (slate_obj.projections_csv if slate_obj else "")
+                    )
+                    slate_name_to_store = slate_name or (slate_obj.name if slate_obj else f"{site} {sport} Slate")
+                    players_filename_to_store = (
+                        players.filename if players and players.filename else (slate_obj.players_filename if slate_obj else "players.csv")
+                    )
+                    projections_filename_to_store = (
+                        projections.filename if projections and projections.filename else (slate_obj.projections_filename if slate_obj else "projections.csv")
+                    )
+                    new_slate = store.save_slate(
+                        site=site,
+                        sport=sport,
+                        name=slate_name_to_store,
+                        players_filename=players_filename_to_store,
+                        projections_filename=projections_filename_to_store,
+                        players_csv=players_csv_text,
+                        projections_csv=projections_csv_text,
+                        records=[record.model_dump() for record in records],
+                        report=mapping_report.model_dump(),
+                        players_mapping=effective_players_mapping,
+                        projection_mapping=effective_projection_mapping,
+                    )
+
+                slate_used = new_slate or slate_obj
+
                 success = f"Run saved with ID {run_id}"
+                if partial_message:
+                    success = f"Partial run saved with ID {run_id}"
                 if lineups_payload:
                     result = {
                         "run_id": run_id,
                         "lineup": lineups_payload[0],
                         "usage_lookup": usage_lookup_mapping,
                         "min_salary": min_salary,
+                        "slate_id": slate_used.slate_id if slate_used else None,
                     }
                 redirect_url = f"/ui/runs/{run_id}"
-
         except ValueError as exc:
-            if job_created:
-                store.update_job_state(run_id, state="failed", message=str(exc))
             error = str(exc)
-        except LineupGenerationPartial as exc:
-            partial_message = exc.message
-            lineups_payload = [
-                LineupResponse(
-                    lineup_id=lineup.lineup_id,
-                    salary=lineup.salary,
-                    projection=lineup.projection,
-                    baseline_projection=lineup.baseline_projection,
-                    players=[
-                        LineupPlayerResponse(
-                            player_id=player.player_id,
-                            name=player.name,
-                            team=player.team,
-                            positions=list(player.positions),
-                            salary=player.salary,
-                            projection=player.projection,
-                            ownership=player.ownership,
-                            baseline_projection=player.baseline_projection,
-                        )
-                        for player in lineup.players
-                    ],
-                )
-                for lineup in exc.lineups
-            ]
-            player_usage = _calculate_player_usage(lineups_payload)
-            usage_lookup_mapping = {item.player_id: item.exposure for item in player_usage}
-            success = f"Partial run saved with ID {run_id}"
-            result = {
-                "run_id": run_id,
-                "lineup": lineups_payload[0],
-                "usage_lookup": usage_lookup_mapping,
-                "min_salary": min_salary,
-            }
-            if job_created:
-                store.update_job_state(run_id, state="completed", message=partial_message)
         finally:
-            proj_path.unlink(missing_ok=True)
+            paths_to_cleanup = {path for path in cleanup_paths if path}
+            if proj_path:
+                paths_to_cleanup.add(proj_path)
             if players_path:
-                players_path.unlink(missing_ok=True)
-
-        if lineups_payload is not None and player_usage is not None:
-            store.save_run(
-                run_id=run_id,
-                site=site,
-                sport=sport,
-                request={
-                    "lineups": lineups,
-                    "max_repeating_players": max_repeating_players,
-                    "max_exposure": max_exposure,
-                    "lineups_per_job": lineups_per_job,
-                    "site": site,
-                    "sport": sport,
-                    "min_salary": min_salary,
-                },
-                report={
-                    "total_players": report.total_players,
-                    "matched_players": report.matched_players,
-                    "players_missing_projection": report.players_missing_projection,
-                    "unmatched_projection_rows": report.unmatched_projection_rows,
-                },
-                lineups=[lineup.model_dump() for lineup in lineups_payload],
-                players_mapping=parsed_players_mapping,
-                projection_mapping=parsed_projection_mapping,
-            )
-            store.update_job_state(run_id, state="completed", message=partial_message)
+                paths_to_cleanup.add(players_path)
+            for path in paths_to_cleanup:
+                path.unlink(missing_ok=True)
 
         if redirect_url:
             return RedirectResponse(url=redirect_url, status_code=303)
 
         runs = store.list_runs(limit=20)
+        slates_data = [slate_to_summary(slate) for slate in store.list_slates(limit=20)]
         content = _render_index_page(
             runs=runs,
             preview=preview,
@@ -1830,9 +2055,11 @@ def create_app() -> FastAPI:
             site_value=site,
             sport_value=sport,
             min_salary_value=min_salary,
+            slates=slates_data,
+            selected_slate_id=slate_id.strip() if slate_id else None,
+            slate_name_value=slate_name,
         )
         return HTMLResponse(content)
-
     @app.get("/ui/runs/{run_id}", response_class=HTMLResponse)
     async def ui_run_detail(request: Request, run_id: str):
         run = _fetch_run_or_404(run_id)

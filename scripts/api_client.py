@@ -89,6 +89,8 @@ def main() -> None:
         print(f"Received {len(payload['lineups'])} lineups")
         if payload.get("message"):
             print(f"Note: {payload['message']}")
+        if payload.get("slate_id"):
+            print(f"Slate ID: {payload['slate_id']}")
         print(json.dumps(payload["lineups"][0], indent=2))
 
 

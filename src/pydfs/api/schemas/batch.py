@@ -12,3 +12,4 @@ class LineupBatchResponse(BaseModel):
     lineups: list[LineupResponse]
     player_usage: list[PlayerUsageResponse]
     message: str | None = None
+    slate_id: str | None = None

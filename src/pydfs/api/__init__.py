@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, cast
 from uuid import uuid4
 
+import urllib.parse
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request, Query
 from fastapi.responses import HTMLResponse, Response, RedirectResponse
 
@@ -405,6 +407,12 @@ def _render_page(body: str) -> str:
         .slate-info {{ margin-bottom: 1.5rem; padding: 1rem; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }}
         .slate-info ul {{ list-style: none; padding: 0; margin: 0.5rem 0 0; }}
         .slate-info li {{ margin-bottom: 0.25rem; }}
+        .slate-info form {{ margin-top: 0.75rem; display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }}
+        .slate-info form label {{ font-weight: 600; }}
+        .slate-info form input[type=\"file\"] {{ flex: 1 1 260px; }}
+        .notice {{ margin: 0.5rem 0; padding: 0.75rem 1rem; border-radius: 6px; }}
+        .notice.success {{ background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }}
+        .notice.error {{ background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }}
     </style>
 </head>
 <body>
@@ -1025,30 +1033,58 @@ def _render_run_detail_page(run: RunRecord) -> str:
 def _render_lineup_pool_page(
     runs: list[RunRecord],
     *,
+    slates: list[SlateRecord],
+    selected_slate: SlateRecord | None,
+    slate_filter: str | None,
     site_filter: str | None,
     sport_filter: str | None,
     limit: int,
     all_dates: bool,
     today: Any,
+    notice: str | None,
+    error: str | None,
 ) -> str:
+    selected_slate_id = selected_slate.slate_id if selected_slate else (slate_filter or None)
+
+    if selected_slate and not site_filter:
+        site_filter = selected_slate.site
+    if selected_slate and not sport_filter:
+        sport_filter = selected_slate.sport
+
     filtered_runs: list[RunRecord] = []
     for run in runs:
-        if site_filter is not None and run.site != site_filter:
-            continue
-        if sport_filter is not None and run.sport != sport_filter:
-            continue
-        run_date = run.created_at.astimezone().date()
-        if not all_dates and run_date != today:
-            continue
+        run_slate_id = run.request.get("slate_id") if isinstance(run.request, dict) else None
+        if selected_slate_id:
+            if run_slate_id != selected_slate_id:
+                continue
+        else:
+            if site_filter is not None and run.site != site_filter:
+                continue
+            if sport_filter is not None and run.sport != sport_filter:
+                continue
+            run_date = run.created_at.astimezone().date()
+            if not all_dates and run_date != today:
+                continue
+        if selected_slate_id and not all_dates:
+            run_date = run.created_at.astimezone().date()
+            if run_date != today:
+                continue
         filtered_runs.append(run)
     filtered_runs = filtered_runs[:limit]
+
     total_runs = len(filtered_runs)
     recent_label = filtered_runs[0].created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S') if filtered_runs else "-"
     latest_run_id = filtered_runs[0].run_id if filtered_runs else "-"
 
     all_lineups: list[LineupResponse] = []
     baseline_lookup: dict[str, float] = {}
-    if filtered_runs:
+    if selected_slate:
+        for record in selected_slate.records:
+            player_id = record.get("player_id")
+            if not player_id:
+                continue
+            baseline_lookup[player_id] = float(record.get("projection", 0.0))
+    elif filtered_runs:
         latest_run = filtered_runs[0]
         latest_lineups = [
             LineupResponse.model_validate(_normalize_lineup_dict(lineup_data)) for lineup_data in latest_run.lineups
@@ -1056,6 +1092,7 @@ def _render_lineup_pool_page(
         for lineup in latest_lineups:
             for player in lineup.players:
                 baseline_lookup[player.player_id] = player.baseline_projection
+
     for run in filtered_runs:
         for lineup_data in run.lineups:
             all_lineups.append(LineupResponse.model_validate(_normalize_lineup_dict(lineup_data)))
@@ -1145,6 +1182,8 @@ def _render_lineup_pool_page(
     )
 
     range_note = "All dates" if all_dates else "Today"
+    if selected_slate:
+        range_note += f" • Slate: {escape(selected_slate.name or 'Unnamed')}"
     summary_section = f"""
     <section>
         <h2>Lineup Pool Summary</h2>
@@ -1155,10 +1194,19 @@ def _render_lineup_pool_page(
     </section>
     """
 
-    runs_list = "".join(
-        f"<li><a href=\"/ui/runs/{run.run_id}\">{run.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}</a> – {run.run_id} ({run.site} {run.sport}, {len(run.lineups)} lineups)</li>"
-        for run in filtered_runs
-    ) or "<p>No runs match the current filters.</p>"
+    runs_list_items = []
+    for run in filtered_runs:
+        run_slate_name = run.request.get("slate_name") if isinstance(run.request, dict) else None
+        run_slate_id = run.request.get("slate_id") if isinstance(run.request, dict) else None
+        slate_descriptor = ""
+        if run_slate_name:
+            slate_descriptor = f" – {escape(str(run_slate_name))}"
+        elif run_slate_id:
+            slate_descriptor = f" – {escape(str(run_slate_id))}"
+        runs_list_items.append(
+            f"<li><a href=\"/ui/runs/{run.run_id}\">{run.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}</a> – {run.run_id} ({run.site} {run.sport}, {len(run.lineups)} lineups{slate_descriptor})</li>"
+        )
+    runs_list = "".join(runs_list_items) or "<p>No runs match the current filters.</p>"
 
     runs_section = f"""
     <section>
@@ -1166,6 +1214,13 @@ def _render_lineup_pool_page(
         <ol>{runs_list}</ol>
     </section>
     """
+
+    slate_options_html = ["<option value=\"\">All slates</option>"]
+    for slate in slates:
+        selected_attr = " selected" if slate.slate_id == selected_slate_id else ""
+        label = f"{slate.site} {slate.sport} – {slate.name or 'Unnamed'}"
+        slate_options_html.append(f"<option value=\"{escape(slate.slate_id)}\"{selected_attr}>{escape(label)}</option>")
+    slate_options = "".join(slate_options_html)
 
     site_options = "".join(
         f"<option value=\"{code}\"{' selected' if site_filter == code else ''}>{label}</option>"
@@ -1180,25 +1235,60 @@ def _render_lineup_pool_page(
     sport_options = "<option value=\"\">All sports</option>" + sport_options
 
     all_dates_checked = " checked" if all_dates else ""
+    site_disabled = " disabled" if selected_slate_id else ""
+    sport_disabled = " disabled" if selected_slate_id else ""
+    hidden_site = (
+        f"<input type=\"hidden\" name=\"site\" value=\"{escape(site_filter)}\">" if selected_slate_id and site_filter else ""
+    )
+    hidden_sport = (
+        f"<input type=\"hidden\" name=\"sport\" value=\"{escape(sport_filter)}\">" if selected_slate_id and sport_filter else ""
+    )
+
+    notice_html = f"<p class=\"notice success\">{escape(notice)}</p>" if notice else ""
+    error_html = f"<p class=\"notice error\">{escape(error)}</p>" if error else ""
+
     filter_form = f"""
     <section>
         <h1>Lineup Pool</h1>
         <p>Latest run: {recent_label} (ID {latest_run_id})</p>
+        {notice_html}{error_html}
         <form method=\"get\" class=\"pool-filter\">
-            <label>Site<select name=\"site\">{site_options}</select></label>
-            <label>Sport<select name=\"sport\">{sport_options}</select></label>
+            <label>Slate<select name=\"slate_id\">{slate_options}</select></label>
+            <label>Site<select name=\"site\"{site_disabled}>{site_options}</select></label>
+            <label>Sport<select name=\"sport\"{sport_disabled}>{sport_options}</select></label>
             <label>Run history depth<input type=\"number\" name=\"limit\" min=\"1\" max=\"500\" value=\"{limit}\"></label>
             <label class=\"checkbox\"><input type=\"checkbox\" name=\"all_dates\" value=\"true\"{all_dates_checked}>Include previous days</label>
             <button type=\"submit\">Apply</button>
+            {hidden_site}
+            {hidden_sport}
         </form>
     </section>
     """
 
+    slate_info_html = ""
+    if selected_slate:
+        slate_info_html = f"""
+        <section class=\"slate-info\">
+            <h2>Current Slate</h2>
+            <ul>
+                <li><strong>Name:</strong> {escape(selected_slate.name or 'Unnamed')}</li>
+                <li><strong>Site/Sport:</strong> {escape(selected_slate.site)} {escape(selected_slate.sport)}</li>
+                <li><strong>Players CSV:</strong> {escape(selected_slate.players_filename)}</li>
+                <li><strong>Projections CSV:</strong> {escape(selected_slate.projections_filename)}</li>
+                <li><strong>Last updated:</strong> {selected_slate.updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}</li>
+            </ul>
+            <form method=\"post\" action=\"/ui/pool/{escape(selected_slate.slate_id)}/update\" enctype=\"multipart/form-data\">
+                <label>Replace projections CSV<input type=\"file\" name=\"projections\" accept=\".csv,text/csv\" required></label>
+                <button type=\"submit\">Update projections</button>
+            </form>
+        </section>
+        """
+
     if total_lineups == 0:
-        body = filter_form + "<p>No lineups have been generated yet for the selected filters.</p>" + runs_section
+        body = filter_form + slate_info_html + "<p>No lineups have been generated yet for the selected filters.</p>" + runs_section
         return _render_page(body)
 
-    body = filter_form + summary_section + usage_table + runs_section + f"<section><h2>Top Lineups</h2>{lineups_html}</section>"
+    body = filter_form + slate_info_html + summary_section + usage_table + runs_section + f"<section><h2>Top Lineups</h2>{lineups_html}</section>"
     return _render_page(body)
 
 
@@ -1518,33 +1608,6 @@ def create_app() -> FastAPI:
         ]
         player_usage = _calculate_player_usage(lineups_payload)
 
-        store.save_run(
-            run_id=run_id,
-            site=site,
-            sport=sport,
-            request={
-                "lineups": request.lineups,
-                "lock_player_ids": request.lock_player_ids,
-                "exclude_player_ids": request.exclude_player_ids,
-                "max_repeating_players": max_repeating_players,
-                "max_from_one_team": request.max_from_one_team,
-                "max_exposure": max_exposure,
-                "lineups_per_job": lineups_per_job,
-                "site": site,
-                "sport": sport,
-                "min_salary": min_salary,
-                "perturbation_p25": perturbation_p25,
-                "perturbation_p75": perturbation_p75,
-            },
-            report=mapping_report.model_dump(),
-            lineups=[lineup.model_dump() for lineup in lineups_payload],
-            players_mapping=effective_players_mapping,
-            projection_mapping=effective_projection_mapping,
-        )
-
-        if partial_message:
-            store.update_job_state(run_id, state="completed", message=partial_message)
-
         new_slate = None
         if new_players_uploaded or new_projections_uploaded:
             players_csv_text = (
@@ -1579,6 +1642,37 @@ def create_app() -> FastAPI:
             )
 
         slate_used = new_slate or slate
+
+        store.save_run(
+            run_id=run_id,
+            site=site,
+            sport=sport,
+            request={
+                "lineups": request.lineups,
+                "lock_player_ids": request.lock_player_ids,
+                "exclude_player_ids": request.exclude_player_ids,
+                "max_repeating_players": max_repeating_players,
+                "max_from_one_team": request.max_from_one_team,
+                "max_exposure": max_exposure,
+                "lineups_per_job": lineups_per_job,
+                "site": site,
+                "sport": sport,
+                "min_salary": min_salary,
+                "perturbation_p25": perturbation_p25,
+                "perturbation_p75": perturbation_p75,
+                "slate_id": slate_used.slate_id if slate_used else slate_id,
+                "slate_name": slate_used.name if slate_used else (slate_name or None),
+                "slate_players_filename": slate_used.players_filename if slate_used else (players.filename if players else None),
+                "slate_projections_filename": slate_used.projections_filename if slate_used else (projections.filename if projections else None),
+            },
+            report=mapping_report.model_dump(),
+            lineups=[lineup.model_dump() for lineup in lineups_payload],
+            players_mapping=effective_players_mapping,
+            projection_mapping=effective_projection_mapping,
+        )
+
+        if partial_message:
+            store.update_job_state(run_id, state="completed", message=partial_message)
 
         response = LineupBatchResponse(
             run_id=run_id,
@@ -1727,21 +1821,81 @@ def create_app() -> FastAPI:
         *,
         site_filter: str | None,
         sport_filter: str | None,
+        slate_filter: str | None,
         limit: int,
         all_dates: bool,
+        notice: str | None,
+        error: str | None,
     ) -> str:
         limit = max(1, min(500, limit))
         fetch_limit = limit if all_dates else max(limit * 3, limit)
+        if slate_filter:
+            fetch_limit = max(fetch_limit, limit * 5)
         runs = store.list_runs(limit=fetch_limit)
+        slates = store.list_slates(limit=50)
+        selected_slate = store.get_slate(slate_filter) if slate_filter else None
+        if selected_slate is None and not slate_filter and not site_filter and not sport_filter and slates:
+            selected_slate = slates[0]
+            slate_filter = selected_slate.slate_id
+        if selected_slate and all(slate.slate_id != selected_slate.slate_id for slate in slates):
+            slates = [selected_slate] + slates
+
         today = datetime.now(timezone.utc).astimezone().date()
         return _render_lineup_pool_page(
             runs,
+            slates=slates,
+            selected_slate=selected_slate,
+            slate_filter=slate_filter,
             site_filter=site_filter,
             sport_filter=sport_filter,
             limit=limit,
             all_dates=all_dates,
             today=today,
+            notice=notice,
+            error=error,
         )
+
+    @app.post("/ui/pool/{slate_id}/update")
+    async def ui_pool_update_projections(
+        slate_id: str,
+        projections: UploadFile = File(...),
+    ):
+        slate = store.get_slate(slate_id)
+        if slate is None:
+            raise HTTPException(status_code=404, detail="Slate not found")
+
+        proj_path, projections_bytes = await _write_temp(projections)
+        if proj_path is None or projections_bytes is None:
+            raise HTTPException(status_code=400, detail="Projections file is empty")
+
+        players_path = _write_temp_from_bytes(slate.players_csv.encode("utf-8"))
+        try:
+            records, merge_report = merge_player_and_projection_files(
+                players_path=players_path,
+                projections_path=proj_path,
+                site=slate.site,
+                sport=slate.sport,
+                players_mapping=slate.players_mapping or None,
+                projection_mapping=slate.projection_mapping or None,
+            )
+            mapping_report = _report_to_mapping(merge_report)
+            store.update_slate(
+                slate_id,
+                projections_filename=projections.filename or slate.projections_filename,
+                projections_csv=projections_bytes.decode("utf-8"),
+                records=[record.model_dump() for record in records],
+                report=mapping_report.model_dump(),
+            )
+        except ValueError as exc:
+            message = urllib.parse.quote_plus(str(exc))
+            return RedirectResponse(f"/ui/pool?slate_id={slate_id}&error={message}", status_code=303)
+        finally:
+            players_path.unlink(missing_ok=True)
+            if proj_path:
+                proj_path.unlink(missing_ok=True)
+
+        notice = urllib.parse.quote_plus("Projections updated")
+        return RedirectResponse(f"/ui/pool?slate_id={slate_id}&notice={notice}", status_code=303)
 
     def _prepare_slate_inputs(
         *,
@@ -1827,14 +1981,20 @@ def create_app() -> FastAPI:
         request: Request,
         site: str | None = None,
         sport: str | None = None,
+        slate_id: str | None = None,
         limit: int = 50,
         all_dates: bool = Query(False),
     ):
+        notice_msg = request.query_params.get("notice")
+        error_msg = request.query_params.get("error")
         content = _render_pool_page(
             site_filter=(site or None) and (site or None).upper(),
             sport_filter=(sport or None) and (sport or None).upper(),
+            slate_filter=slate_id,
             limit=limit,
             all_dates=all_dates,
+            notice=notice_msg,
+            error=error_msg,
         )
         return HTMLResponse(content)
 
@@ -1846,11 +2006,16 @@ def create_app() -> FastAPI:
         limit: int = 50,
         all_dates: bool = Query(False),
     ):
+        notice_msg = request.query_params.get("notice")
+        error_msg = request.query_params.get("error")
         content = _render_pool_page(
             site_filter=site.upper(),
             sport_filter=sport.upper(),
+            slate_filter=request.query_params.get("slate_id"),
             limit=limit,
             all_dates=all_dates,
+            notice=notice_msg,
+            error=error_msg,
         )
         return HTMLResponse(content)
 
@@ -2004,27 +2169,6 @@ def create_app() -> FastAPI:
                 player_usage = _calculate_player_usage(lineups_payload)
                 usage_lookup_mapping = {item.player_id: item.exposure for item in player_usage}
 
-                store.save_run(
-                    run_id=run_id,
-                    site=site,
-                    sport=sport,
-                    request={
-                        "lineups": lineups,
-                        "max_repeating_players": max_repeating_players,
-                        "max_exposure": max_exposure,
-                        "lineups_per_job": lineups_per_job,
-                        "site": site,
-                        "sport": sport,
-                        "min_salary": min_salary,
-                        "perturbation_p25": perturbation_p25,
-                        "perturbation_p75": perturbation_p75,
-                    },
-                    report=mapping_report.model_dump(),
-                    lineups=[lineup.model_dump() for lineup in lineups_payload],
-                    players_mapping=effective_players_mapping,
-                    projection_mapping=effective_projection_mapping,
-                )
-
                 new_slate = None
                 if new_players_uploaded or new_projections_uploaded:
                     players_csv_text = (
@@ -2059,6 +2203,31 @@ def create_app() -> FastAPI:
                     )
 
                 slate_used = new_slate or slate_obj
+
+                store.save_run(
+                    run_id=run_id,
+                    site=site,
+                    sport=sport,
+                    request={
+                        "lineups": lineups,
+                        "max_repeating_players": max_repeating_players,
+                        "max_exposure": max_exposure,
+                        "lineups_per_job": lineups_per_job,
+                        "site": site,
+                        "sport": sport,
+                        "min_salary": min_salary,
+                        "perturbation_p25": perturbation_p25,
+                        "perturbation_p75": perturbation_p75,
+                        "slate_id": slate_used.slate_id if slate_used else (slate_id.strip() if slate_id else None),
+                        "slate_name": slate_used.name if slate_used else (slate_name or None),
+                        "slate_players_filename": slate_used.players_filename if slate_used else (players.filename if players else None),
+                        "slate_projections_filename": slate_used.projections_filename if slate_used else (projections.filename if projections else None),
+                    },
+                    report=mapping_report.model_dump(),
+                    lineups=[lineup.model_dump() for lineup in lineups_payload],
+                    players_mapping=effective_players_mapping,
+                    projection_mapping=effective_projection_mapping,
+                )
 
                 success = f"Run saved with ID {run_id}"
                 if partial_message:

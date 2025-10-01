@@ -42,6 +42,20 @@ Ted End,DEN,$5800,10.5,7.5
 Luke Flex,NYJ,$5500,9.0,6.0
 Bengals Defense,CIN,$4000,6.0,4.0
 """
+
+
+def _updated_projections() -> str:
+    return """player,team,salary,fantasy,proj_own
+Joe Quarterback,CIN,$8000,30.5,18.0
+Rob Runner,CIN,$7500,17.0,12.5
+Sam Rusher,DEN,$7200,14.0,10.0
+Will Receiver,CIN,$6900,12.2,14.0
+Max Target,DEN,$6600,13.0,9.0
+Leo Fly,NYJ,$6400,7.0,8.5
+Ted End,DEN,$5800,11.0,7.5
+Luke Flex,NYJ,$5500,8.5,6.0
+Bengals Defense,CIN,$4000,5.0,4.0
+"""
 @pytest.mark.anyio
 async def test_health(client: AsyncClient):
     resp = await client.get("/health")
@@ -109,6 +123,8 @@ async def test_lineups_endpoint(client: AsyncClient):
     assert detail["job"] is not None
     assert detail["request"]["perturbation_p25"] == pytest.approx(0.0)
     assert detail["request"]["perturbation_p75"] == pytest.approx(0.0)
+    assert detail["request"].get("slate_id")
+    assert detail["request"].get("slate_projections_filename")
 
     resp = await client.post(f"/runs/{run_id}/rerun")
     assert resp.status_code == 200
@@ -145,6 +161,10 @@ async def test_lineups_with_stored_slate(client: AsyncClient):
     second_payload = resp2.json()
     assert second_payload["slate_id"] == slate_id
     assert len(second_payload["lineups"]) == 1
+    detail_again = await client.get(f"/runs/{second_payload['run_id']}")
+    detail_again.raise_for_status()
+    run_detail = detail_again.json()
+    assert run_detail["request"]["slate_id"] == slate_id
 
 
 @pytest.mark.anyio
@@ -171,6 +191,7 @@ async def test_lineups_with_custom_perturbation_ranges(client: AsyncClient):
     detail = detail_resp.json()
     assert detail["request"]["perturbation_p25"] == pytest.approx(40.0)
     assert detail["request"]["perturbation_p75"] == pytest.approx(10.0)
+    assert detail["request"].get("slate_id")
 
 
 @pytest.mark.anyio
@@ -215,8 +236,9 @@ async def test_lineup_pool_page(client: AsyncClient):
     resp = await client.get("/ui/pool")
     assert resp.status_code == 200
     assert "Lineup Pool" in resp.text
-    assert "Runs included</th><td>" in resp.text
+    assert "name=\"slate_id\"" in resp.text
     assert "Range: Today" in resp.text
+    assert "Replace projections CSV" in resp.text
 
     resp_filtered = await client.get("/ui/pool", params={"site": "FD", "sport": "NFL", "limit": 10})
     assert resp_filtered.status_code == 200
@@ -225,3 +247,39 @@ async def test_lineup_pool_page(client: AsyncClient):
     resp_shortcut = await client.get("/ui/pool/nfl/fd")
     assert resp_shortcut.status_code == 200
     assert "Lineup Pool" in resp_shortcut.text
+
+
+@pytest.mark.anyio
+async def test_update_slate_projections_from_pool(client: AsyncClient):
+    files = {
+        "projections": ("projections.csv", _sample_projections(), "text/csv"),
+        "players": ("players.csv", _sample_players(), "text/csv"),
+    }
+    data = {
+        "lineup_request": "{\"lineups\": 1}",
+        "projection_mapping": "{\"name\": \"player\", \"team\": \"team\", \"salary\": \"salary\", \"projection\": \"fantasy\", \"ownership\": \"proj_own\"}",
+    }
+    resp = await client.post("/lineups", files=files, data=data)
+    resp.raise_for_status()
+    payload = resp.json()
+    slate_id = payload["slate_id"]
+    store = client.app.state.run_store
+
+    update_resp = await client.post(
+        f"/ui/pool/{slate_id}/update",
+        files={"projections": ("updated.csv", _updated_projections(), "text/csv")},
+        follow_redirects=False,
+    )
+    assert update_resp.status_code == 303
+
+    slate = store.get_slate(slate_id)
+    assert slate is not None
+    assert slate.projections_filename == "updated.csv"
+    projection_lookup = {record["player_id"]: record["projection"] for record in slate.records}
+    assert projection_lookup["1"] == pytest.approx(30.5)
+
+    follow_url = update_resp.headers["location"]
+    follow_resp = await client.get(follow_url)
+    assert follow_resp.status_code == 200
+    assert "Projections updated" in follow_resp.text
+    assert "updated.csv" in follow_resp.text

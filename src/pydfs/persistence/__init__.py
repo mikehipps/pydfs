@@ -335,6 +335,74 @@ class RunStore:
             raise KeyError(f"Slate {slate_id} not found after insert")
         return slate
 
+    def update_slate(
+        self,
+        slate_id: str,
+        *,
+        name: str | None = None,
+        players_filename: str | None = None,
+        projections_filename: str | None = None,
+        players_csv: str | None = None,
+        projections_csv: str | None = None,
+        records: Iterable[dict] | None = None,
+        report: dict | None = None,
+        players_mapping: dict | None = None,
+        projection_mapping: dict | None = None,
+    ) -> SlateRecord:
+        slate = self.get_slate(slate_id)
+        if slate is None:
+            raise KeyError(f"Slate {slate_id} not found")
+
+        updated_name = name if name is not None else slate.name
+        updated_players_filename = players_filename if players_filename is not None else slate.players_filename
+        updated_projections_filename = (
+            projections_filename if projections_filename is not None else slate.projections_filename
+        )
+        updated_players_csv = players_csv if players_csv is not None else slate.players_csv
+        updated_projections_csv = projections_csv if projections_csv is not None else slate.projections_csv
+        updated_records = list(records) if records is not None else slate.records
+        updated_report = report if report is not None else slate.report
+        updated_players_mapping = players_mapping if players_mapping is not None else slate.players_mapping
+        updated_projection_mapping = projection_mapping if projection_mapping is not None else slate.projection_mapping
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE slates
+                SET name = ?,
+                    players_filename = ?,
+                    projections_filename = ?,
+                    players_csv = ?,
+                    projections_csv = ?,
+                    records_json = ?,
+                    report_json = ?,
+                    players_mapping_json = ?,
+                    projection_mapping_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    updated_name,
+                    updated_players_filename,
+                    updated_projections_filename,
+                    updated_players_csv,
+                    updated_projections_csv,
+                    json.dumps(list(updated_records)),
+                    json.dumps(updated_report),
+                    json.dumps(updated_players_mapping),
+                    json.dumps(updated_projection_mapping),
+                    now,
+                    slate_id,
+                ),
+            )
+            conn.commit()
+
+        updated = self.get_slate(slate_id)
+        if updated is None:  # pragma: no cover
+            raise KeyError(f"Slate {slate_id} not found after update")
+        return updated
+
     def get_slate(self, slate_id: Optional[str]) -> Optional[SlateRecord]:
         if not slate_id:
             return None

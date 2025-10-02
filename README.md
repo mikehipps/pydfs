@@ -27,3 +27,5 @@ pip install -e .[dev]
 4. Layer on persistence / API / UI pieces once the core optimizer contract is stable.
 
 Tracking work in issues / ADRs up front will help keep multi-sport support consistent as we grow.
+
+_Temporary sync test note – safe to remove once verified._

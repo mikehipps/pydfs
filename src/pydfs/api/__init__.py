@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import tempfile
 import statistics
 from bisect import bisect_left, bisect_right
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from html import escape
 from io import StringIO
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Iterable, Literal, Mapping, Sequence, cast
 from uuid import uuid4
 
 import urllib.parse
@@ -28,12 +29,19 @@ from pydfs.api.schemas import (
     LineupResponse,
     MappingPreviewResponse,
     PlayerUsageResponse,
+    PoolFilterRequest,
+    PoolFilterResponse,
+    PoolFilteredLineup,
+    PoolFilterSummary,
 )
 from pydfs.ingest import merge_player_and_projection_files
 from pydfs.ingest.projections import MergeReport
 from pydfs.models import PlayerRecord
 from pydfs.optimizer import LineupGenerationPartial, build_lineups
 from pydfs.persistence import RunJob, RunRecord, RunStore, SlateRecord
+from pydfs.pool import FilterCriteria, export_lineups_to_csv, filter_lineups
+from pydfs.pool.export import ContestExportError
+from pydfs.pool.filtering import FilteredLineup, LineupCandidate
 
 
 DEFAULT_PLAYERS_MAPPING = {
@@ -121,6 +129,18 @@ def _calculate_player_usage(lineups: list[LineupResponse]) -> list[PlayerUsageRe
         )
         for player_id, data in sorted_usage
     ]
+
+
+def _calculate_filtered_player_usage(
+    selections: Sequence[LineupCandidate] | Sequence[FilteredLineup],
+) -> list[PlayerUsageResponse]:
+    """Compute player usage for a selection of unique lineups."""
+
+    lineups: list[LineupResponse] = []
+    for item in selections:
+        candidate = item.candidate if isinstance(item, FilteredLineup) else item
+        lineups.append(candidate.lineup)
+    return _calculate_player_usage(lineups)
 
 
 def _report_to_mapping(report: MappingPreviewResponse | MergeReport | dict) -> MappingPreviewResponse:
@@ -237,6 +257,264 @@ def _normalize_lineup_dict(lineup_data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _baseline_lookup_for_pool(
+    selected_slate: SlateRecord | None,
+    runs: list[RunRecord],
+) -> dict[str, float]:
+    lookup: dict[str, float] = {}
+    if selected_slate:
+        for record in selected_slate.records:
+            player_id = record.get("player_id")
+            if not player_id:
+                continue
+            lookup[player_id] = float(record.get("projection", 0.0))
+        return lookup
+
+    if runs:
+        latest_run = runs[0]
+        for lineup_data in latest_run.lineups:
+            lineup = LineupResponse.model_validate(_normalize_lineup_dict(lineup_data))
+            for player in lineup.players:
+                lookup[player.player_id] = player.baseline_projection
+
+    return lookup
+
+
+def _ensure_bias_summary(
+    bias_summary: dict | None,
+    *,
+    lineups: Sequence[Any] | None,
+    exposure_bias: float | None,
+    exposure_bias_target: float | None,
+) -> dict:
+    if bias_summary:
+        return bias_summary
+    player_ids: set[str] = set()
+    if lineups:
+        for lineup in lineups:
+            player_ids.update(player.player_id for player in lineup.players)
+    factors = {player_id: 1.0 for player_id in sorted(player_ids)} if player_ids else {}
+    target = exposure_bias_target if exposure_bias_target is not None else 0.0
+    strength = exposure_bias if exposure_bias is not None else 0.0
+    return {
+        "min_factor": 1.0,
+        "max_factor": 1.0,
+        "target_percent": target,
+        "strength_percent": strength,
+        "lineups_tracked": len(lineups) if lineups else 0,
+        "factors": factors,
+    }
+
+
+def _prepare_pool_analysis(
+    runs: list[RunRecord],
+    *,
+    baseline_lookup: Mapping[str, float] | None,
+) -> tuple[dict[str, Any], list[LineupCandidate]]:
+    all_lineups: list[LineupResponse] = []
+    lineup_origins: dict[tuple[str, ...], set[str]] = {}
+
+    for run in runs:
+        for lineup_data in run.lineups:
+            lineup = LineupResponse.model_validate(_normalize_lineup_dict(lineup_data))
+            signature = _lineup_signature(lineup.players)
+            lineup_origins.setdefault(signature, set()).add(run.run_id)
+            all_lineups.append(lineup)
+
+    analysis = _analyze_lineups(all_lineups, baseline_overrides=baseline_lookup)
+    lineup_groups = analysis["lineup_groups"]
+    lineup_metrics = analysis["lineup_metrics"]
+
+    candidates: list[LineupCandidate] = []
+    for signature, bucket in lineup_groups.items():
+        lineup = cast(LineupResponse, bucket["lineup"])
+        metrics = lineup_metrics.get(signature, {})
+        run_ids = tuple(sorted(lineup_origins.get(signature, set())))
+        bucket["run_ids"] = list(run_ids)
+        candidates.append(
+            LineupCandidate(
+                signature=signature,
+                lineup=lineup,
+                count=int(bucket["count"]),
+                run_ids=run_ids,
+                salary=lineup.salary,
+                projection=lineup.projection,
+                baseline=metrics.get("baseline", lineup.baseline_projection),
+                usage_sum=metrics.get("usage_sum", 0.0),
+                uniqueness=metrics.get("uniqueness", 0.0),
+                baseline_percentile=metrics.get("baseline_percentile", 0.0),
+                usage_percentile=metrics.get("usage_percentile", 0.0),
+                uniqueness_percentile=metrics.get("uniqueness_percentile", 0.0),
+            )
+        )
+
+    return analysis, candidates
+
+
+def _split_tokens(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    tokens = [token.strip() for token in re.split(r"[\s,]+", value) if token.strip()]
+    return tuple(tokens)
+
+
+SortByLiteral = Literal["baseline", "projection", "salary", "usage", "uniqueness"]
+SortDirLiteral = Literal["asc", "desc"]
+
+
+def _parse_pool_filter_inputs(
+    params: Mapping[str, str],
+) -> tuple[FilterCriteria, dict[str, str], list[str]]:
+    errors: list[str] = []
+    values: dict[str, str] = {}
+
+    def _float_field(name: str, label: str) -> float | None:
+        raw = params.get(name)
+        values[name] = raw or ""
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            errors.append(f"Invalid {label}: {raw}")
+            return None
+
+    def _percent_field(name: str, label: str) -> float | None:
+        raw = params.get(name)
+        values[name] = raw or ""
+        if raw in (None, ""):
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            errors.append(f"Invalid {label}: {raw}")
+            return None
+        if value > 1:
+            value /= 100
+        if value < 0 or value > 1:
+            errors.append(f"{label} must be between 0 and 100")
+            return None
+        return value
+
+    def _player_caps_field(name: str) -> tuple[tuple[str, float], ...]:
+        raw = params.get(name)
+        values[name] = raw or ""
+        if raw in (None, ""):
+            return ()
+        entries: list[tuple[str, float]] = []
+        for token in re.split(r"[\n,]+", raw):
+            token = token.strip()
+            if not token:
+                continue
+            if "=" in token:
+                player_id, cap_str = token.split("=", 1)
+            elif ":" in token:
+                player_id, cap_str = token.split(":", 1)
+            else:
+                errors.append(
+                    "Player exposure caps must use player_id=percent format"
+                )
+                continue
+            player_id = player_id.strip()
+            cap_str = cap_str.strip()
+            if not player_id or not cap_str:
+                errors.append(
+                    "Player exposure caps require both player ID and percentage"
+                )
+                continue
+            try:
+                value = float(cap_str)
+            except ValueError:
+                errors.append(f"Invalid exposure percentage for {player_id}: {cap_str}")
+                continue
+            if value > 1:
+                value /= 100
+            if value < 0 or value > 1:
+                errors.append(
+                    f"Exposure percentage for {player_id} must be between 0 and 100"
+                )
+                continue
+            entries.append((player_id, value))
+        return tuple(entries)
+
+    def _int_field(name: str, label: str) -> int | None:
+        raw = params.get(name)
+        values[name] = raw or ""
+        if raw in (None, ""):
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            errors.append(f"Invalid {label}: {raw}")
+            return None
+
+    def _token_field(name: str, *, upper: bool = False) -> tuple[str, ...]:
+        raw = params.get(name)
+        values[name] = raw or ""
+        tokens = _split_tokens(raw)
+        if upper:
+            tokens = tuple(token.upper() for token in tokens)
+        return tokens
+
+    min_baseline = _float_field("baseline_min", "baseline minimum")
+    max_baseline = _float_field("baseline_max", "baseline maximum")
+    min_projection = _float_field("projection_min", "projection minimum")
+    max_projection = _float_field("projection_max", "projection maximum")
+    min_salary = _int_field("salary_min", "minimum salary")
+    max_salary = _int_field("salary_max", "maximum salary")
+    min_usage_sum = _float_field("usage_min", "minimum usage sum")
+    max_usage_sum = _float_field("usage_max", "maximum usage sum")
+    min_uniqueness = _float_field("uniqueness_min", "minimum uniqueness")
+    max_uniqueness = _float_field("uniqueness_max", "maximum uniqueness")
+    include_player_ids = _token_field("include_players")
+    exclude_player_ids = _token_field("exclude_players")
+    include_team_codes = _token_field("include_teams", upper=True)
+    exclude_team_codes = _token_field("exclude_teams", upper=True)
+    max_exposure = _percent_field("max_exposure", "max exposure")
+    player_caps = _player_caps_field("player_caps")
+
+    limit_raw = _int_field("filter_limit", "filtered lineup limit")
+    limit = None
+    if limit_raw is not None:
+        limit = max(1, min(500, limit_raw))
+
+    sort_raw = (params.get("filter_sort") or "baseline").lower()
+    values["filter_sort"] = sort_raw
+    if sort_raw not in {"baseline", "projection", "salary", "usage", "uniqueness"}:
+        errors.append(f"Invalid sort field: {sort_raw}")
+        sort_raw = "baseline"
+
+    sort_dir_raw = (params.get("filter_dir") or "desc").lower()
+    values["filter_dir"] = sort_dir_raw
+    if sort_dir_raw not in {"asc", "desc"}:
+        errors.append(f"Invalid sort direction: {sort_dir_raw}")
+        sort_dir_raw = "desc"
+
+    criteria = FilterCriteria(
+        min_baseline=min_baseline,
+        max_baseline=max_baseline,
+        min_projection=min_projection,
+        max_projection=max_projection,
+        min_salary=min_salary,
+        max_salary=max_salary,
+        min_usage_sum=min_usage_sum,
+        max_usage_sum=max_usage_sum,
+        min_uniqueness=min_uniqueness,
+        max_uniqueness=max_uniqueness,
+        include_player_ids=include_player_ids,
+        exclude_player_ids=exclude_player_ids,
+        include_team_codes=include_team_codes,
+        exclude_team_codes=exclude_team_codes,
+        limit=limit or 20,
+        sort_by=cast(SortByLiteral, sort_raw),
+        sort_direction=cast(SortDirLiteral, sort_dir_raw),
+        max_player_exposure=max_exposure,
+        player_exposure_caps=player_caps,
+    )
+
+    return criteria, values, errors
+
+
 def _write_temp_from_bytes(contents: bytes) -> Path:
     tmp = tempfile.NamedTemporaryFile(delete=False)
     try:
@@ -316,6 +594,8 @@ def job_to_dict(job: RunJob) -> dict:
 def run_record_to_dict(run: RunRecord, job: RunJob | None = None) -> dict:
     lineups = [LineupResponse.model_validate(_normalize_lineup_dict(lineup)) for lineup in run.lineups]
     usage = _calculate_player_usage(lineups)
+    bias_summary = run.request.get("bias_summary") if isinstance(run.request, dict) else None
+
     payload = {
         "run_id": run.run_id,
         "created_at": run.created_at.isoformat(),
@@ -328,6 +608,8 @@ def run_record_to_dict(run: RunRecord, job: RunJob | None = None) -> dict:
         "players_mapping": run.players_mapping,
         "projection_mapping": run.projection_mapping,
     }
+    if bias_summary is not None:
+        payload["bias_summary"] = bias_summary
     if job:
         payload["state"] = job.state
         payload["job"] = job_to_dict(job)
@@ -1116,6 +1398,9 @@ def _render_lineup_pool_page(
     today: Any,
     notice: str | None,
     error: str | None,
+    filter_criteria: FilterCriteria,
+    filter_values: Mapping[str, str],
+    filter_errors: list[str],
 ) -> str:
     selected_slate_id = selected_slate.slate_id if selected_slate else (slate_filter or None)
 
@@ -1149,28 +1434,9 @@ def _render_lineup_pool_page(
     recent_label = filtered_runs[0].created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S') if filtered_runs else "-"
     latest_run_id = filtered_runs[0].run_id if filtered_runs else "-"
 
-    all_lineups: list[LineupResponse] = []
-    baseline_lookup: dict[str, float] = {}
-    if selected_slate:
-        for record in selected_slate.records:
-            player_id = record.get("player_id")
-            if not player_id:
-                continue
-            baseline_lookup[player_id] = float(record.get("projection", 0.0))
-    elif filtered_runs:
-        latest_run = filtered_runs[0]
-        latest_lineups = [
-            LineupResponse.model_validate(_normalize_lineup_dict(lineup_data)) for lineup_data in latest_run.lineups
-        ]
-        for lineup in latest_lineups:
-            for player in lineup.players:
-                baseline_lookup[player.player_id] = player.baseline_projection
+    baseline_lookup = _baseline_lookup_for_pool(selected_slate, filtered_runs)
+    analysis, candidates = _prepare_pool_analysis(filtered_runs, baseline_lookup=baseline_lookup)
 
-    for run in filtered_runs:
-        for lineup_data in run.lineups:
-            all_lineups.append(LineupResponse.model_validate(_normalize_lineup_dict(lineup_data)))
-
-    analysis = _analyze_lineups(all_lineups, baseline_overrides=baseline_lookup)
     usage = analysis["usage"]
     usage_lookup = analysis["usage_lookup"]
     lineup_groups = analysis["lineup_groups"]
@@ -1179,29 +1445,24 @@ def _render_lineup_pool_page(
     lineup_usage_sums = analysis["usage_sums"]
     lineup_uniqueness_scores = analysis["uniqueness_scores"]
     unique_players_used = analysis["unique_players"]
-
-    total_lineups = len(all_lineups)
+    total_lineups = len(analysis["lineups"])
     unique_lineups = len(lineup_groups)
 
     if baseline_scores:
-        mean_score = statistics.fmean(baseline_scores)
-        median_score = statistics.median(baseline_scores)
-        std_score = statistics.pstdev(baseline_scores) if len(baseline_scores) > 1 else 0.0
         sorted_scores = sorted(baseline_scores, reverse=True)
         top10_count = max(1, int(len(sorted_scores) * 0.10))
         top1_count = max(1, int(len(sorted_scores) * 0.01))
         top10_avg = sum(sorted_scores[:top10_count]) / top10_count
         top1_avg = sum(sorted_scores[:top1_count]) / top1_count
     else:
-        mean_score = median_score = std_score = top10_avg = top1_avg = 0.0
+        top10_avg = top1_avg = 0.0
         top10_count = top1_count = 0
 
     if lineup_usage_sums:
-        usage_mean = statistics.fmean(lineup_usage_sums)
         usage_median = statistics.median(lineup_usage_sums)
         usage_std = statistics.pstdev(lineup_usage_sums) if len(lineup_usage_sums) > 1 else 0.0
     else:
-        usage_mean = usage_median = usage_std = 0.0
+        usage_median = usage_std = 0.0
 
     if lineup_uniqueness_scores:
         uniqueness_mean = statistics.fmean(lineup_uniqueness_scores)
@@ -1209,6 +1470,16 @@ def _render_lineup_pool_page(
         uniqueness_std = statistics.pstdev(lineup_uniqueness_scores) if len(lineup_uniqueness_scores) > 1 else 0.0
     else:
         uniqueness_mean = uniqueness_median = uniqueness_std = 0.0
+
+    filter_result = filter_lineups(candidates, filter_criteria)
+    pool_summary = filter_result.pool_summary
+
+    def _fmt_float(value: float | None, precision: int = 2) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.{precision}f}"
+
+    filtered_usage = _calculate_filtered_player_usage(filter_result.lineups)
 
     lineups_html, _ = _render_top_lineups(
         lineup_groups,
@@ -1218,34 +1489,40 @@ def _render_lineup_pool_page(
         descriptor="baseline projection",
     )
 
-    usage_rows = "".join(
-        f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td><td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
-        for item in usage
-    ) or "<tr><td colspan=5>No lineups available.</td></tr>"
+    def _render_usage_section(title: str, items: Sequence[PlayerUsageResponse]) -> str:
+        rows = "".join(
+            f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td><td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
+            for item in items
+        ) or "<tr><td colspan=5>No lineups available.</td></tr>"
+        return f"""
+        <section>
+            <h2>{title}</h2>
+            <table>
+                <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </section>
+        """
 
-    usage_table = f"""
-    <section>
-        <h2>Player Usage (All Runs)</h2>
-        <table>
-            <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
-            <tbody>{usage_rows}</tbody>
-        </table>
-    </section>
-    """
+    usage_table = _render_usage_section("Player Usage (All Runs)", usage)
+    filtered_usage_table = _render_usage_section(
+        "Player Usage (Filtered Selection)", filtered_usage
+    )
 
     display_top1_count = max(top1_count, 1)
     summary_rows = "".join(
         [
             f"<tr><th>Runs included</th><td>{total_runs}</td></tr>",
-            f"<tr><th>Total lineups</th><td>{total_lineups}</td></tr>",
+            f"<tr><th>Total lineup instances</th><td>{pool_summary.total_instances}</td></tr>",
             f"<tr><th>Unique lineups</th><td>{unique_lineups}</td></tr>",
             f"<tr><th>Unique players</th><td>{len(unique_players_used)}</td></tr>",
-            f"<tr><th>Mean baseline projection</th><td>{mean_score:.2f}</td></tr>",
-            f"<tr><th>Median baseline projection</th><td>{median_score:.2f}</td></tr>",
-            f"<tr><th>Baseline std. dev.</th><td>{std_score:.2f}</td></tr>",
+            f"<tr><th>Mean baseline projection</th><td>{_fmt_float(pool_summary.baseline_mean)}</td></tr>",
+            f"<tr><th>Median baseline projection</th><td>{_fmt_float(pool_summary.baseline_median)}</td></tr>",
+            f"<tr><th>Baseline std. dev.</th><td>{_fmt_float(pool_summary.baseline_std)}</td></tr>",
             f"<tr><th>Top 10% average ({top10_count} lineups)</th><td>{top10_avg:.2f}</td></tr>",
             f"<tr><th>Top 1% average ({display_top1_count} lineup{'s' if display_top1_count != 1 else ''})</th><td>{top1_avg:.2f}</td></tr>",
-            f"<tr><th>Mean usage sum</th><td>{usage_mean:.1f}%</td></tr>",
+            f"<tr><th>Mean perturbed projection</th><td>{_fmt_float(pool_summary.projection_mean)}</td></tr>",
+            f"<tr><th>Mean usage sum</th><td>{_fmt_float(pool_summary.usage_mean, 1)}%</td></tr>",
             f"<tr><th>Median usage sum</th><td>{usage_median:.1f}%</td></tr>",
             f"<tr><th>Usage std. dev.</th><td>{usage_std:.1f}%</td></tr>",
             f"<tr><th>Mean uniqueness</th><td>{_format_large(uniqueness_mean)}</td></tr>",
@@ -1259,13 +1536,111 @@ def _render_lineup_pool_page(
         range_note += f" • Slate: {escape(selected_slate.name or 'Unnamed')}"
     summary_section = f"""
     <section>
-        <h2>Lineup Pool Summary</h2>
+        <h2>Pool Summary</h2>
         <p>Range: {range_note}</p>
         <table>
             {summary_rows}
         </table>
     </section>
     """
+
+    filtered_summary = filter_result.summary
+
+    filtered_summary_rows = "".join(
+        [
+            f"<tr><th>Available unique lineups</th><td>{filtered_summary.available_lineups}</td></tr>",
+            f"<tr><th>Selected unique lineups</th><td>{filtered_summary.selected_lineups}</td></tr>",
+            f"<tr><th>Total lineup instances</th><td>{filtered_summary.total_instances}</td></tr>",
+            f"<tr><th>Mean baseline projection</th><td>{_fmt_float(filtered_summary.baseline_mean)}</td></tr>",
+            f"<tr><th>Baseline std. dev.</th><td>{_fmt_float(filtered_summary.baseline_std)}</td></tr>",
+            f"<tr><th>Mean perturbed projection</th><td>{_fmt_float(filtered_summary.projection_mean)}</td></tr>",
+            f"<tr><th>Mean usage sum</th><td>{_fmt_float(filtered_summary.usage_mean, 1)}%</td></tr>",
+            f"<tr><th>Mean uniqueness</th><td>{'-' if filtered_summary.uniqueness_mean is None else _format_large(filtered_summary.uniqueness_mean)}</td></tr>",
+        ]
+    )
+
+    filtered_summary_section = f"""
+    <section>
+        <h2>Filtered Lineup Summary</h2>
+        <table>
+            {filtered_summary_rows}
+        </table>
+    </section>
+    """
+
+    filtered_rows = []
+    for item in filter_result.lineups:
+        candidate = item.candidate
+        run_ids_display = ", ".join(candidate.run_ids) if candidate.run_ids else "-"
+        players_display = "<br>".join(
+            f"{escape(player.name)} ({'/'.join(player.positions)}) – {escape(player.team)}"
+            for player in candidate.lineup.players
+        )
+        filtered_rows.append(
+            "<tr>"
+            f"<td>{item.rank}</td>"
+            f"<td>{escape(candidate.lineup.lineup_id)}</td>"
+            f"<td>{run_ids_display}</td>"
+            f"<td>{candidate.salary}</td>"
+            f"<td>{candidate.baseline:.2f}</td>"
+            f"<td>{candidate.projection:.2f}</td>"
+            f"<td>{candidate.usage_sum:.1f}%</td>"
+            f"<td>{_format_large(candidate.uniqueness)}</td>"
+            f"<td>{candidate.count}</td>"
+            f"<td>{players_display}</td>"
+            "</tr>"
+        )
+
+    if filtered_rows:
+        filtered_table = "".join(filtered_rows)
+        filtered_table_section = f"""
+        <section>
+            <h2>Filtered Lineups ({len(filter_result.lineups)})</h2>
+            <table>
+                <thead><tr><th>#</th><th>Lineup</th><th>Runs</th><th>Salary</th><th>Baseline</th><th>Perturbed</th><th>Usage Sum</th><th>Uniqueness</th><th>Instances</th><th>Players</th></tr></thead>
+                <tbody>{filtered_table}</tbody>
+            </table>
+        </section>
+        """
+    else:
+        filtered_table_section = "<section><h2>Filtered Lineups</h2><p>No lineups match the current filters.</p></section>"
+
+    export_button_html = ""
+    if filter_result.lineups:
+        export_params: dict[str, str] = {}
+        if selected_slate_id:
+            export_params["slate_id"] = selected_slate_id
+        if site_filter and not selected_slate_id:
+            export_params["site"] = site_filter
+        if sport_filter and not selected_slate_id:
+            export_params["sport"] = sport_filter
+        export_params["limit"] = str(limit)
+        if all_dates:
+            export_params["all_dates"] = "true"
+        export_params["filter_limit"] = str(filter_criteria.limit)
+        for key in [
+            "baseline_min",
+            "baseline_max",
+            "projection_min",
+            "projection_max",
+            "salary_min",
+            "salary_max",
+            "usage_min",
+            "usage_max",
+            "uniqueness_min",
+            "uniqueness_max",
+            "include_players",
+            "exclude_players",
+            "include_teams",
+            "exclude_teams",
+            "filter_sort",
+            "filter_dir",
+        ]:
+            value = filter_values.get(key)
+            if value:
+                export_params[key] = value
+        export_url = f"/pool/export.csv?{urllib.parse.urlencode(export_params)}"
+        export_button_html = f"<p><a class=\"button\" href=\"{export_url}\">Download filtered lineups (CSV)</a></p>"
 
     runs_list_items = []
     for run in filtered_runs:
@@ -1319,18 +1694,76 @@ def _render_lineup_pool_page(
 
     notice_html = f"<p class=\"notice success\">{escape(notice)}</p>" if notice else ""
     error_html = f"<p class=\"notice error\">{escape(error)}</p>" if error else ""
+    filter_error_html = "".join(
+        f"<p class=\"notice error\">{escape(msg)}</p>" for msg in filter_errors
+    )
+
+    baseline_min_val = escape(filter_values.get("baseline_min", ""))
+    baseline_max_val = escape(filter_values.get("baseline_max", ""))
+    projection_min_val = escape(filter_values.get("projection_min", ""))
+    projection_max_val = escape(filter_values.get("projection_max", ""))
+    salary_min_val = escape(filter_values.get("salary_min", ""))
+    salary_max_val = escape(filter_values.get("salary_max", ""))
+    usage_min_val = escape(filter_values.get("usage_min", ""))
+    usage_max_val = escape(filter_values.get("usage_max", ""))
+    uniqueness_min_val = escape(filter_values.get("uniqueness_min", ""))
+    uniqueness_max_val = escape(filter_values.get("uniqueness_max", ""))
+    include_players_val = escape(filter_values.get("include_players", ""))
+    exclude_players_val = escape(filter_values.get("exclude_players", ""))
+    include_teams_val = escape(filter_values.get("include_teams", ""))
+    exclude_teams_val = escape(filter_values.get("exclude_teams", ""))
+    sort_value = filter_values.get("filter_sort") or filter_criteria.sort_by
+    dir_value = filter_values.get("filter_dir") or filter_criteria.sort_direction
+    limit_value = filter_values.get("filter_limit") or str(filter_criteria.limit)
+    max_exposure_val = escape(filter_values.get("max_exposure", ""))
+    player_caps_val = escape(filter_values.get("player_caps", ""))
+
+    sort_options_html = "".join(
+        f"<option value=\"{value}\"{' selected' if sort_value == value else ''}>{label}</option>"
+        for value, label in [
+            ("baseline", "Baseline projection"),
+            ("projection", "Perturbed projection"),
+            ("salary", "Salary"),
+            ("usage", "Usage sum"),
+            ("uniqueness", "Uniqueness"),
+        ]
+    )
+
+    dir_options_html = "".join(
+        f"<option value=\"{value}\"{' selected' if dir_value == value else ''}>{label}</option>"
+        for value, label in [("desc", "High → Low"), ("asc", "Low → High")]
+    )
 
     filter_form = f"""
     <section>
         <h1>Lineup Pool</h1>
         <p>Latest run: {recent_label} (ID {latest_run_id})</p>
-        {notice_html}{error_html}
+        {notice_html}{error_html}{filter_error_html}
         <form method=\"get\" class=\"pool-filter\">
             <label>Slate<select name=\"slate_id\">{slate_options}</select></label>
             <label>Site<select name=\"site\"{site_disabled}>{site_options}</select></label>
             <label>Sport<select name=\"sport\"{sport_disabled}>{sport_options}</select></label>
             <label>Run history depth<input type=\"number\" name=\"limit\" min=\"1\" max=\"500\" value=\"{limit}\"></label>
             <label class=\"checkbox\"><input type=\"checkbox\" name=\"all_dates\" value=\"true\"{all_dates_checked}>Include previous days</label>
+            <label>Baseline min<input type=\"number\" step=\"0.1\" name=\"baseline_min\" value=\"{baseline_min_val}\"></label>
+            <label>Baseline max<input type=\"number\" step=\"0.1\" name=\"baseline_max\" value=\"{baseline_max_val}\"></label>
+            <label>Perturbed min<input type=\"number\" step=\"0.1\" name=\"projection_min\" value=\"{projection_min_val}\"></label>
+            <label>Perturbed max<input type=\"number\" step=\"0.1\" name=\"projection_max\" value=\"{projection_max_val}\"></label>
+            <label>Salary min<input type=\"number\" name=\"salary_min\" value=\"{salary_min_val}\"></label>
+            <label>Salary max<input type=\"number\" name=\"salary_max\" value=\"{salary_max_val}\"></label>
+            <label>Usage sum min<input type=\"number\" step=\"0.1\" name=\"usage_min\" value=\"{usage_min_val}\"></label>
+            <label>Usage sum max<input type=\"number\" step=\"0.1\" name=\"usage_max\" value=\"{usage_max_val}\"></label>
+            <label>Uniqueness min<input type=\"number\" step=\"0.1\" name=\"uniqueness_min\" value=\"{uniqueness_min_val}\"></label>
+            <label>Uniqueness max<input type=\"number\" step=\"0.1\" name=\"uniqueness_max\" value=\"{uniqueness_max_val}\"></label>
+            <label>Include players<input type=\"text\" name=\"include_players\" placeholder=\"player IDs\" value=\"{include_players_val}\"></label>
+            <label>Exclude players<input type=\"text\" name=\"exclude_players\" placeholder=\"player IDs\" value=\"{exclude_players_val}\"></label>
+            <label>Include teams<input type=\"text\" name=\"include_teams\" placeholder=\"team codes\" value=\"{include_teams_val}\"></label>
+            <label>Exclude teams<input type=\"text\" name=\"exclude_teams\" placeholder=\"team codes\" value=\"{exclude_teams_val}\"></label>
+            <label>Sort by<select name=\"filter_sort\">{sort_options_html}</select></label>
+            <label>Order<select name=\"filter_dir\">{dir_options_html}</select></label>
+            <label>Lineups to show<input type=\"number\" name=\"filter_limit\" min=\"1\" max=\"500\" value=\"{escape(limit_value)}\"></label>
+            <label>Max exposure %<input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" name=\"max_exposure\" value=\"{max_exposure_val}\" placeholder=\"25\"></label>
+            <label>Player exposure caps<textarea name=\"player_caps\" rows=\"2\" placeholder=\"player_id=25, other_id=15\">{player_caps_val}</textarea></label>
             <button type=\"submit\">Apply</button>
             {hidden_site}
             {hidden_sport}
@@ -1357,12 +1790,29 @@ def _render_lineup_pool_page(
         </section>
         """
 
-    if total_lineups == 0:
-        body = filter_form + slate_info_html + "<p>No lineups have been generated yet for the selected filters.</p>" + runs_section
-        return _render_page(body)
+    sections = [
+        filter_form,
+        slate_info_html,
+        summary_section,
+        filtered_summary_section,
+        filtered_usage_table,
+        filtered_table_section,
+        export_button_html,
+    ]
 
-    body = filter_form + slate_info_html + summary_section + usage_table + runs_section + f"<section><h2>Top Lineups</h2>{lineups_html}</section>"
-    return _render_page(body)
+    if total_lineups == 0:
+        sections.append("<p>No lineups have been generated yet for the selected filters.</p>")
+        sections.append(runs_section)
+        return _render_page("".join(sections))
+
+    sections.extend(
+        [
+            usage_table,
+            runs_section,
+            f"<section><h2>Top Lineups</h2>{lineups_html}</section>",
+        ]
+    )
+    return _render_page("".join(sections))
 
 
 def _run_to_csv(run: RunRecord) -> str:
@@ -1614,7 +2064,6 @@ def create_app() -> FastAPI:
 
         records: list[PlayerRecord] = slate_inputs["records"]
         raw_records: list[PlayerRecord] = slate_inputs.get("raw_records", records)
-        raw_records: list[PlayerRecord] = slate_inputs.get("raw_records", records)
         mapping_report: MappingPreviewResponse = slate_inputs["report"]
         slate = slate_inputs["slate"]
         effective_players_mapping = slate_inputs["effective_players_mapping"]
@@ -1654,14 +2103,24 @@ def create_app() -> FastAPI:
                 exposure_bias_target=exposure_bias_target,
             )
             lineups = build_output.lineups
-            bias_summary = build_output.bias_summary or {}
+            bias_summary = _ensure_bias_summary(
+                build_output.bias_summary,
+                lineups=lineups,
+                exposure_bias=exposure_bias,
+                exposure_bias_target=exposure_bias_target,
+            )
         except ValueError as exc:
             store.update_job_state(run_id, state="failed", message=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LineupGenerationPartial as exc:
             partial_message = exc.message
             lineups = exc.lineups
-            bias_summary = exc.bias_summary or {}
+            bias_summary = _ensure_bias_summary(
+                exc.bias_summary,
+                lineups=lineups,
+                exposure_bias=exposure_bias,
+                exposure_bias_target=exposure_bias_target,
+            )
         except Exception as exc:  # pragma: no cover
             store.update_job_state(run_id, state="failed", message=str(exc))
             raise
@@ -1781,7 +2240,7 @@ def create_app() -> FastAPI:
             player_usage=player_usage,
             message=partial_message,
             slate_id=slate_used.slate_id if slate_used else None,
-            bias_summary=bias_summary or None,
+            bias_summary=bias_summary,
         )
         return response
 
@@ -1930,6 +2389,9 @@ def create_app() -> FastAPI:
         all_dates: bool,
         notice: str | None,
         error: str | None,
+        filter_criteria: FilterCriteria,
+        filter_values: Mapping[str, str],
+        filter_errors: list[str],
     ) -> str:
         limit = max(1, min(500, limit))
         fetch_limit = limit if all_dates else max(limit * 3, limit)
@@ -1984,6 +2446,9 @@ def create_app() -> FastAPI:
             today=today,
             notice=notice,
             error=error,
+            filter_criteria=filter_criteria,
+            filter_values=filter_values,
+            filter_errors=filter_errors,
         )
 
     @app.post("/ui/pool/{slate_id}/update")
@@ -2057,8 +2522,24 @@ def create_app() -> FastAPI:
         resolved_site = slate.site if slate and not new_players_uploaded and players_path is None else site
         resolved_sport = slate.sport if slate and not new_players_uploaded and players_path is None else sport
 
-        effective_players_mapping = dict(players_mapping) if players_mapping else (dict(slate.players_mapping) if slate else {})
-        effective_projection_mapping = dict(projection_mapping) if projection_mapping else (dict(slate.projection_mapping) if slate else {})
+        effective_players_mapping = (
+            dict(players_mapping)
+            if players_mapping
+            else (
+                dict(slate.players_mapping)
+                if slate and slate.players_mapping
+                else default_players_mapping.copy()
+            )
+        )
+        effective_projection_mapping = (
+            dict(projection_mapping)
+            if projection_mapping
+            else (
+                dict(slate.projection_mapping)
+                if slate and slate.projection_mapping
+                else default_projection_mapping.copy()
+            )
+        )
 
         cleanup_paths: list[Path] = []
         if players_path is None:
@@ -2125,6 +2606,7 @@ def create_app() -> FastAPI:
     ):
         notice_msg = request.query_params.get("notice")
         error_msg = request.query_params.get("error")
+        filter_criteria, filter_values, filter_errors = _parse_pool_filter_inputs(request.query_params)
         content = _render_pool_page(
             site_filter=(site or None) and (site or None).upper(),
             sport_filter=(sport or None) and (sport or None).upper(),
@@ -2133,6 +2615,9 @@ def create_app() -> FastAPI:
             all_dates=all_dates,
             notice=notice_msg,
             error=error_msg,
+            filter_criteria=filter_criteria,
+            filter_values=filter_values,
+            filter_errors=filter_errors,
         )
         return HTMLResponse(content)
 
@@ -2145,6 +2630,7 @@ def create_app() -> FastAPI:
     ):
         notice_msg = request.query_params.get("notice")
         error_msg = request.query_params.get("error")
+        filter_criteria, filter_values, filter_errors = _parse_pool_filter_inputs(request.query_params)
         content = _render_pool_page(
             site_filter=None,
             sport_filter=sport.upper(),
@@ -2153,6 +2639,9 @@ def create_app() -> FastAPI:
             all_dates=all_dates,
             notice=notice_msg,
             error=error_msg,
+            filter_criteria=filter_criteria,
+            filter_values=filter_values,
+            filter_errors=filter_errors,
         )
         return HTMLResponse(content)
 
@@ -2166,6 +2655,7 @@ def create_app() -> FastAPI:
     ):
         notice_msg = request.query_params.get("notice")
         error_msg = request.query_params.get("error")
+        filter_criteria, filter_values, filter_errors = _parse_pool_filter_inputs(request.query_params)
         content = _render_pool_page(
             site_filter=site.upper(),
             sport_filter=sport.upper(),
@@ -2174,8 +2664,246 @@ def create_app() -> FastAPI:
             all_dates=all_dates,
             notice=notice_msg,
             error=error_msg,
+            filter_criteria=filter_criteria,
+            filter_values=filter_values,
+            filter_errors=filter_errors,
         )
         return HTMLResponse(content)
+
+    @app.post("/pool/filter", response_model=PoolFilterResponse)
+    async def api_pool_filter(request_model: PoolFilterRequest) -> PoolFilterResponse:
+        site_filter = request_model.site.upper() if request_model.site else None
+        sport_filter = request_model.sport.upper() if request_model.sport else None
+        slate_filter = request_model.slate_id
+        limit = request_model.run_limit or 50
+        all_dates = request_model.all_dates
+
+        limit = max(1, min(500, limit))
+        fetch_limit = limit if all_dates else max(limit * 3, limit)
+        if slate_filter:
+            fetch_limit = max(fetch_limit, limit * 5)
+        runs = store.list_runs(limit=fetch_limit)
+
+        selected_slate: SlateRecord | None = store.get_slate(slate_filter) if slate_filter else None
+        if selected_slate is None and site_filter and sport_filter:
+            selected_slate = store.get_latest_slate(site=site_filter, sport=sport_filter)
+        if selected_slate is None and sport_filter:
+            selected_slate = store.get_latest_slate(sport=sport_filter)
+        if selected_slate is None and site_filter:
+            selected_slate = store.get_latest_slate(site=site_filter)
+
+        base_slates = store.list_slates(limit=50)
+        if selected_slate is None and base_slates:
+            selected_slate = base_slates[0]
+        if selected_slate is not None:
+            slate_filter = selected_slate.slate_id
+
+        today = datetime.now(timezone.utc).astimezone().date()
+
+        filtered_runs: list[RunRecord] = []
+        for run in runs:
+            run_slate_id = run.request.get("slate_id") if isinstance(run.request, dict) else None
+            if slate_filter:
+                if run_slate_id != slate_filter:
+                    continue
+            else:
+                if site_filter and run.site != site_filter:
+                    continue
+                if sport_filter and run.sport != sport_filter:
+                    continue
+                run_date = run.created_at.astimezone().date()
+                if not all_dates and run_date != today:
+                    continue
+            if slate_filter and not all_dates:
+                run_date = run.created_at.astimezone().date()
+                if run_date != today:
+                    continue
+            filtered_runs.append(run)
+        filtered_runs = filtered_runs[:limit]
+
+        baseline_lookup = _baseline_lookup_for_pool(selected_slate, filtered_runs)
+        analysis, candidates = _prepare_pool_analysis(filtered_runs, baseline_lookup=baseline_lookup)
+
+        filter_criteria = FilterCriteria(
+            min_baseline=request_model.min_baseline,
+            max_baseline=request_model.max_baseline,
+            min_projection=request_model.min_projection,
+            max_projection=request_model.max_projection,
+            min_salary=request_model.min_salary,
+            max_salary=request_model.max_salary,
+            min_usage_sum=request_model.min_usage_sum,
+            max_usage_sum=request_model.max_usage_sum,
+            min_uniqueness=request_model.min_uniqueness,
+            max_uniqueness=request_model.max_uniqueness,
+            include_player_ids=tuple(request_model.include_player_ids or []),
+            exclude_player_ids=tuple(request_model.exclude_player_ids or []),
+            include_team_codes=tuple(code.upper() for code in (request_model.include_team_codes or [])),
+            exclude_team_codes=tuple(code.upper() for code in (request_model.exclude_team_codes or [])),
+            limit=max(1, min(500, request_model.limit or 20)),
+            sort_by=request_model.sort_by,
+            sort_direction=request_model.sort_direction,
+            max_player_exposure=request_model.max_player_exposure,
+            player_exposure_caps=tuple(sorted((player_id, value) for player_id, value in (request_model.player_exposure_caps or {}).items())),
+        )
+
+        filter_result = filter_lineups(candidates, filter_criteria)
+
+        pool_usage_payload = list(analysis.get("usage", []))
+        filtered_usage_payload = _calculate_filtered_player_usage(filter_result.lineups)
+
+        summary_payload = PoolFilterSummary(
+            available_lineups=filter_result.summary.available_lineups,
+            selected_lineups=filter_result.summary.selected_lineups,
+            total_instances=filter_result.summary.total_instances,
+            baseline_mean=filter_result.summary.baseline_mean,
+            baseline_median=filter_result.summary.baseline_median,
+            baseline_std=filter_result.summary.baseline_std,
+            projection_mean=filter_result.summary.projection_mean,
+            usage_mean=filter_result.summary.usage_mean,
+            uniqueness_mean=filter_result.summary.uniqueness_mean,
+        )
+        pool_summary_payload = PoolFilterSummary(
+            available_lineups=filter_result.pool_summary.available_lineups,
+            selected_lineups=filter_result.pool_summary.selected_lineups,
+            total_instances=filter_result.pool_summary.total_instances,
+            baseline_mean=filter_result.pool_summary.baseline_mean,
+            baseline_median=filter_result.pool_summary.baseline_median,
+            baseline_std=filter_result.pool_summary.baseline_std,
+            projection_mean=filter_result.pool_summary.projection_mean,
+            usage_mean=filter_result.pool_summary.usage_mean,
+            uniqueness_mean=filter_result.pool_summary.uniqueness_mean,
+        )
+
+        lineups_payload = [
+            PoolFilteredLineup(
+                rank=item.rank,
+                lineup_id=item.candidate.lineup.lineup_id,
+                run_ids=list(item.candidate.run_ids),
+                salary=item.candidate.salary,
+                projection=item.candidate.projection,
+                baseline_projection=item.candidate.baseline,
+                usage_sum=item.candidate.usage_sum,
+                uniqueness=item.candidate.uniqueness,
+                count=item.candidate.count,
+                players=list(item.candidate.lineup.players),
+            )
+            for item in filter_result.lineups
+        ]
+
+        return PoolFilterResponse(
+            summary=summary_payload,
+            pool_summary=pool_summary_payload,
+            lineups=lineups_payload,
+            pool_usage=pool_usage_payload,
+            filtered_usage=filtered_usage_payload,
+        )
+
+    @app.get("/pool/export.csv")
+    async def export_pool_csv(
+        request: Request,
+        site: str | None = None,
+        sport: str | None = None,
+        slate_id: str | None = None,
+        limit: int = 50,
+        all_dates: bool = Query(False),
+    ):
+        filter_criteria, filter_values, filter_errors = _parse_pool_filter_inputs(request.query_params)
+        if filter_errors:
+            raise HTTPException(status_code=400, detail="; ".join(filter_errors))
+
+        site_filter = site.upper() if site else None
+        sport_filter = sport.upper() if sport else None
+        slate_filter = slate_id
+
+        limit = max(1, min(500, limit))
+        fetch_limit = limit if all_dates else max(limit * 3, limit)
+        if slate_filter:
+            fetch_limit = max(fetch_limit, limit * 5)
+        runs = store.list_runs(limit=fetch_limit)
+
+        selected_slate: SlateRecord | None = store.get_slate(slate_filter) if slate_filter else None
+        if selected_slate is None and site_filter and sport_filter:
+            selected_slate = store.get_latest_slate(site=site_filter, sport=sport_filter)
+        if selected_slate is None and sport_filter:
+            selected_slate = store.get_latest_slate(sport=sport_filter)
+        if selected_slate is None and site_filter:
+            selected_slate = store.get_latest_slate(site=site_filter)
+
+        base_slates = store.list_slates(limit=50)
+        if selected_slate is None and base_slates:
+            selected_slate = base_slates[0]
+        if selected_slate is not None:
+            slate_filter = selected_slate.slate_id
+
+        today = datetime.now(timezone.utc).astimezone().date()
+
+        filtered_runs: list[RunRecord] = []
+        for run in runs:
+            run_slate_id = run.request.get("slate_id") if isinstance(run.request, dict) else None
+            if slate_filter:
+                if run_slate_id != slate_filter:
+                    continue
+            else:
+                if site_filter and run.site != site_filter:
+                    continue
+                if sport_filter and run.sport != sport_filter:
+                    continue
+                run_date = run.created_at.astimezone().date()
+                if not all_dates and run_date != today:
+                    continue
+            if slate_filter and not all_dates:
+                run_date = run.created_at.astimezone().date()
+                if run_date != today:
+                    continue
+            filtered_runs.append(run)
+        filtered_runs = filtered_runs[:limit]
+
+        if not filtered_runs:
+            raise HTTPException(status_code=404, detail="No runs available for export")
+
+        baseline_lookup = _baseline_lookup_for_pool(selected_slate, filtered_runs)
+        _analysis, candidates = _prepare_pool_analysis(filtered_runs, baseline_lookup=baseline_lookup)
+
+        filter_result = filter_lineups(candidates, filter_criteria)
+        if not filter_result.lineups:
+            raise HTTPException(status_code=404, detail="No lineups match the provided filters")
+
+        export_site = (
+            selected_slate.site
+            if selected_slate
+            else (site_filter or filtered_runs[0].site)
+        )
+        export_sport = (
+            selected_slate.sport
+            if selected_slate
+            else (sport_filter or filtered_runs[0].sport)
+        )
+
+        entry_names: list[str] = []
+        for item in filter_result.lineups:
+            if item.candidate.run_ids:
+                base_name = f"{item.candidate.run_ids[0]}-{item.candidate.lineup.lineup_id}"
+                if len(item.candidate.run_ids) > 1:
+                    base_name += f"(+{len(item.candidate.run_ids) - 1})"
+            else:
+                base_name = item.candidate.lineup.lineup_id
+            entry_names.append(base_name)
+
+        try:
+            csv_text = export_lineups_to_csv(
+                [item.candidate.lineup for item in filter_result.lineups],
+                site=export_site,
+                sport=export_sport,
+                entry_names=entry_names,
+            )
+        except ContestExportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return Response(
+            content=csv_text,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=pool-export.csv"},
+        )
 
     @app.post("/slates/{slate_id}/reset-bias")
     async def reset_slate_bias(slate_id: str, redirect: str | None = Form(None)):
@@ -2259,6 +2987,7 @@ def create_app() -> FastAPI:
         site = slate_inputs["resolved_site"]
         sport = slate_inputs["resolved_sport"]
         records: list[PlayerRecord] = slate_inputs["records"]
+        raw_records: list[PlayerRecord] = slate_inputs["raw_records"]
         mapping_report: MappingPreviewResponse = slate_inputs["report"]
         slate_obj = slate_inputs["slate"]
         effective_players_mapping = slate_inputs["effective_players_mapping"]
@@ -2309,11 +3038,21 @@ def create_app() -> FastAPI:
                         exposure_bias_target=exposure_bias_target,
                     )
                     built_lineups = build_output.lineups
-                    bias_summary = build_output.bias_summary or {}
+                    bias_summary = _ensure_bias_summary(
+                        build_output.bias_summary,
+                        lineups=built_lineups,
+                        exposure_bias=exposure_bias,
+                        exposure_bias_target=exposure_bias_target,
+                    )
                 except LineupGenerationPartial as exc:
                     partial_message = exc.message
                     built_lineups = exc.lineups
-                    bias_summary = exc.bias_summary or {}
+                    bias_summary = _ensure_bias_summary(
+                        exc.bias_summary,
+                        lineups=built_lineups,
+                        exposure_bias=exposure_bias,
+                        exposure_bias_target=exposure_bias_target,
+                    )
                     store.update_job_state(run_id, state="completed", message=exc.message)
                 except Exception as exc:
                     store.update_job_state(run_id, state="failed", message=str(exc))

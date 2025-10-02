@@ -102,3 +102,10 @@ and ship lineups once they're generated. Prioritise the following track so the w
 6. **Follow-up hygiene**
    - Document contest templates and filter presets in `README` once implemented.
    - Add end-to-end tests (API + UI) that cover a filter → export cycle to prevent regressions.
+
+## Session Summary (2025-02-12)
+- **Filtering UX**: `/ui/pool` now exposes baseline/projection/salary/usage/uniqueness filters with player/team include/exclude
+  controls, surfaces filtered summaries, and wires a CSV export button for contest-ready payloads.
+- **API endpoints**: Added `POST /pool/filter` for programmatic filtering plus `GET /pool/export.csv` for FanDuel Classic exports
+  powered by the new `pydfs.pool.filtering` and `pydfs.pool.export` helpers.
+- **Regression coverage**: New integration test exercises the filter → export flow to keep the API + UI contract locked down.

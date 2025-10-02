@@ -21,12 +21,20 @@ pip install -e .[dev]
 
 ## Next steps
 
-1. Productise the lineup pool: expose robust filtering, selection, and export flows (UI + API) so generated runs can ship
-   directly to contest CSVs.
+1. Build the hand-builder workflow: surface lock/exclude tooling against the filtered pool and persist manual lineups for
+   export alongside optimizer results.
 2. Solidify core models (`players`, `slates`, `constraints`) under `src/pydfs/models/` and ensure they're reused by the solver,
    persistence, and export layers.
 3. Expand ingestion adapters beyond the current sport/site defaults while keeping projections + injury data normalised across
    slates.
 4. Continue layering persistence / API / UI improvements once the optimizer contract and export pipeline are stable.
+
+## Lineup pool filtering & export
+
+- The `/ui/pool` view now includes projection, salary, usage, uniqueness, player, and team filters plus contest-ready CSV
+  export for the filtered selection.
+- Programmatic access is available via `POST /pool/filter` (returns filtered lineups + summary metrics) and
+  `GET /pool/export.csv` (downloads the filtered lineups in FanDuel Classic format).
+- Filtering logic lives under `pydfs.pool.filtering` and the contest serializers under `pydfs.pool.export`.
 
 Tracking work in issues / ADRs up front will help keep multi-sport support consistent as we grow.

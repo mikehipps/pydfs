@@ -820,8 +820,11 @@ def _build_lineups_serial(
 
     active_records = _filter_player_pool(list(records), mandatory_ids=lock_player_ids)
     optimizer = get_optimizer(_resolve_site(site), _resolve_sport(sport))
-    if min_salary is not None and hasattr(optimizer, "min_salary_cap"):
-        optimizer.min_salary_cap = min_salary
+    if min_salary is not None:
+        if hasattr(optimizer, "set_min_salary_cap"):
+            optimizer.set_min_salary_cap(min_salary)
+        elif hasattr(optimizer, "min_salary_cap"):
+            optimizer.min_salary_cap = min_salary
     logger.info(
         "Optimizer salary caps – max=%s min=%s",
         getattr(optimizer, "max_salary", None),

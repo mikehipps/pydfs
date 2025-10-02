@@ -79,6 +79,7 @@ class FilterResult:
 
     lineups: list[FilteredLineup]
     summary: FilterSummary
+    pool_summary: FilterSummary
 
 
 def _passes_criteria(candidate: LineupCandidate, criteria: FilterCriteria) -> bool:
@@ -132,33 +133,11 @@ def _sort_key(candidate: LineupCandidate, criteria: FilterCriteria) -> float:
     return candidate.baseline
 
 
-def filter_lineups(
-    candidates: Sequence[LineupCandidate],
-    criteria: FilterCriteria,
-) -> FilterResult:
-    """Filter lineups and return ordered selections with summary statistics."""
-
-    filtered = [candidate for candidate in candidates if _passes_criteria(candidate, criteria)]
-    available = len(filtered)
-
-    reverse = criteria.sort_direction != "asc"
-    filtered.sort(key=lambda c: (_sort_key(c, criteria), c.lineup.lineup_id), reverse=reverse)
-
-    if criteria.limit is not None and criteria.limit > 0:
-        filtered = filtered[: criteria.limit]
-
-    ranked: list[FilteredLineup] = [
-        FilteredLineup(candidate=candidate, rank=index)
-        for index, candidate in enumerate(filtered, start=1)
-    ]
-
-    total_instances = sum(item.candidate.count for item in ranked)
-
-    baselines = [item.candidate.baseline for item in ranked]
-    projections = [item.candidate.projection for item in ranked]
-    usage_values = [item.candidate.usage_sum for item in ranked]
-    uniqueness_values = [item.candidate.uniqueness for item in ranked]
-
+def _build_summary(
+    *,
+    available: Sequence[LineupCandidate],
+    selected: Sequence[LineupCandidate],
+) -> FilterSummary:
     def _safe_stats(values: Iterable[float]) -> tuple[float | None, float | None, float | None]:
         values = list(values)
         if not values:
@@ -168,15 +147,20 @@ def filter_lineups(
         std = pstdev(values) if len(values) > 1 else 0.0
         return mean, med, std
 
+    baselines = [candidate.baseline for candidate in selected]
+    projections = [candidate.projection for candidate in selected]
+    usage_values = [candidate.usage_sum for candidate in selected]
+    uniqueness_values = [candidate.uniqueness for candidate in selected]
+
     baseline_mean, baseline_median, baseline_std = _safe_stats(baselines)
     projection_mean, _, _ = _safe_stats(projections)
     usage_mean, _, _ = _safe_stats(usage_values)
     uniqueness_mean, _, _ = _safe_stats(uniqueness_values)
 
-    summary = FilterSummary(
-        available_lineups=available,
-        selected_lineups=len(ranked),
-        total_instances=total_instances,
+    return FilterSummary(
+        available_lineups=len(available),
+        selected_lineups=len(selected),
+        total_instances=sum(candidate.count for candidate in selected),
         baseline_mean=baseline_mean,
         baseline_median=baseline_median,
         baseline_std=baseline_std,
@@ -185,7 +169,42 @@ def filter_lineups(
         uniqueness_mean=uniqueness_mean,
     )
 
-    return FilterResult(lineups=ranked, summary=summary)
+
+def filter_lineups(
+    candidates: Sequence[LineupCandidate],
+    criteria: FilterCriteria,
+) -> FilterResult:
+    """Filter lineups and return ordered selections with summary statistics."""
+
+    candidate_list = list(candidates)
+    filtered_candidates = [
+        candidate for candidate in candidate_list if _passes_criteria(candidate, criteria)
+    ]
+
+    reverse = criteria.sort_direction != "asc"
+    filtered_candidates.sort(
+        key=lambda c: (_sort_key(c, criteria), c.lineup.lineup_id), reverse=reverse
+    )
+
+    selected_candidates = filtered_candidates
+    if criteria.limit is not None and criteria.limit > 0:
+        selected_candidates = filtered_candidates[: criteria.limit]
+
+    ranked: list[FilteredLineup] = [
+        FilteredLineup(candidate=candidate, rank=index)
+        for index, candidate in enumerate(selected_candidates, start=1)
+    ]
+
+    filtered_summary = _build_summary(
+        available=filtered_candidates,
+        selected=selected_candidates,
+    )
+    pool_summary = _build_summary(
+        available=candidate_list,
+        selected=candidate_list,
+    )
+
+    return FilterResult(lineups=ranked, summary=filtered_summary, pool_summary=pool_summary)
 
 
 __all__ = [

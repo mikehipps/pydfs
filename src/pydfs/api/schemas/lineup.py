@@ -104,5 +104,6 @@ class PoolFilteredLineup(BaseModel):
 
 
 class PoolFilterResponse(BaseModel):
+    pool_summary: PoolFilterSummary
     summary: PoolFilterSummary
     lineups: List[PoolFilteredLineup]

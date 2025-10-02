@@ -363,6 +363,7 @@ async def test_pool_filter_and_export(client: AsyncClient):
     filter_resp = await client.post("/pool/filter", json=filter_request)
     filter_resp.raise_for_status()
     body = filter_resp.json()
+    assert body["pool_summary"]["available_lineups"] >= body["summary"]["available_lineups"]
     assert body["summary"]["available_lineups"] >= 1
     assert body["lineups"], "Filtered lineups should not be empty"
     first_lineup = body["lineups"][0]

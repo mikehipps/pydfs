@@ -2667,6 +2667,17 @@ def create_app() -> FastAPI:
             usage_mean=filter_result.summary.usage_mean,
             uniqueness_mean=filter_result.summary.uniqueness_mean,
         )
+        pool_summary_payload = PoolFilterSummary(
+            available_lineups=filter_result.pool_summary.available_lineups,
+            selected_lineups=filter_result.pool_summary.selected_lineups,
+            total_instances=filter_result.pool_summary.total_instances,
+            baseline_mean=filter_result.pool_summary.baseline_mean,
+            baseline_median=filter_result.pool_summary.baseline_median,
+            baseline_std=filter_result.pool_summary.baseline_std,
+            projection_mean=filter_result.pool_summary.projection_mean,
+            usage_mean=filter_result.pool_summary.usage_mean,
+            uniqueness_mean=filter_result.pool_summary.uniqueness_mean,
+        )
 
         lineups_payload = [
             PoolFilteredLineup(
@@ -2684,7 +2695,11 @@ def create_app() -> FastAPI:
             for item in filter_result.lineups
         ]
 
-        return PoolFilterResponse(summary=summary_payload, lineups=lineups_payload)
+        return PoolFilterResponse(
+            summary=summary_payload,
+            pool_summary=pool_summary_payload,
+            lineups=lineups_payload,
+        )
 
     @app.get("/pool/export.csv")
     async def export_pool_csv(

@@ -76,6 +76,8 @@ class PoolFilterRequest(BaseModel):
     sort_by: Literal["baseline", "projection", "salary", "usage", "uniqueness"] = "baseline"
     sort_direction: Literal["asc", "desc"] = "desc"
     run_limit: int | None = Field(default=None, ge=1, le=500)
+    max_player_exposure: float | None = Field(default=None, ge=0.0, le=1.0)
+    player_exposure_caps: dict[str, float] | None = None
 
 
 class PoolFilterSummary(BaseModel):

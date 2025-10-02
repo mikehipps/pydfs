@@ -28,7 +28,7 @@ from pydfs.api.schemas import (
     LineupRequest,
     LineupResponse,
     MappingPreviewResponse,
-  PlayerUsageResponse,
+    PlayerUsageResponse,
     PoolFilterRequest,
     PoolFilterResponse,
     PoolFilteredLineup,
@@ -379,6 +379,64 @@ def _parse_pool_filter_inputs(
             errors.append(f"Invalid {label}: {raw}")
             return None
 
+    def _percent_field(name: str, label: str) -> float | None:
+        raw = params.get(name)
+        values[name] = raw or ""
+        if raw in (None, ""):
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            errors.append(f"Invalid {label}: {raw}")
+            return None
+        if value > 1:
+            value /= 100
+        if value < 0 or value > 1:
+            errors.append(f"{label} must be between 0 and 100")
+            return None
+        return value
+
+    def _player_caps_field(name: str) -> tuple[tuple[str, float], ...]:
+        raw = params.get(name)
+        values[name] = raw or ""
+        if raw in (None, ""):
+            return ()
+        entries: list[tuple[str, float]] = []
+        for token in re.split(r"[\n,]+", raw):
+            token = token.strip()
+            if not token:
+                continue
+            if "=" in token:
+                player_id, cap_str = token.split("=", 1)
+            elif ":" in token:
+                player_id, cap_str = token.split(":", 1)
+            else:
+                errors.append(
+                    "Player exposure caps must use player_id=percent format"
+                )
+                continue
+            player_id = player_id.strip()
+            cap_str = cap_str.strip()
+            if not player_id or not cap_str:
+                errors.append(
+                    "Player exposure caps require both player ID and percentage"
+                )
+                continue
+            try:
+                value = float(cap_str)
+            except ValueError:
+                errors.append(f"Invalid exposure percentage for {player_id}: {cap_str}")
+                continue
+            if value > 1:
+                value /= 100
+            if value < 0 or value > 1:
+                errors.append(
+                    f"Exposure percentage for {player_id} must be between 0 and 100"
+                )
+                continue
+            entries.append((player_id, value))
+        return tuple(entries)
+
     def _int_field(name: str, label: str) -> int | None:
         raw = params.get(name)
         values[name] = raw or ""
@@ -412,6 +470,8 @@ def _parse_pool_filter_inputs(
     exclude_player_ids = _token_field("exclude_players")
     include_team_codes = _token_field("include_teams", upper=True)
     exclude_team_codes = _token_field("exclude_teams", upper=True)
+    max_exposure = _percent_field("max_exposure", "max exposure")
+    player_caps = _player_caps_field("player_caps")
 
     limit_raw = _int_field("filter_limit", "filtered lineup limit")
     limit = None
@@ -448,6 +508,8 @@ def _parse_pool_filter_inputs(
         limit=limit or 20,
         sort_by=cast(SortByLiteral, sort_raw),
         sort_direction=cast(SortDirLiteral, sort_dir_raw),
+        max_player_exposure=max_exposure,
+        player_exposure_caps=player_caps,
     )
 
     return criteria, values, errors
@@ -1653,6 +1715,8 @@ def _render_lineup_pool_page(
     sort_value = filter_values.get("filter_sort") or filter_criteria.sort_by
     dir_value = filter_values.get("filter_dir") or filter_criteria.sort_direction
     limit_value = filter_values.get("filter_limit") or str(filter_criteria.limit)
+    max_exposure_val = escape(filter_values.get("max_exposure", ""))
+    player_caps_val = escape(filter_values.get("player_caps", ""))
 
     sort_options_html = "".join(
         f"<option value=\"{value}\"{' selected' if sort_value == value else ''}>{label}</option>"
@@ -1698,6 +1762,8 @@ def _render_lineup_pool_page(
             <label>Sort by<select name=\"filter_sort\">{sort_options_html}</select></label>
             <label>Order<select name=\"filter_dir\">{dir_options_html}</select></label>
             <label>Lineups to show<input type=\"number\" name=\"filter_limit\" min=\"1\" max=\"500\" value=\"{escape(limit_value)}\"></label>
+            <label>Max exposure %<input type=\"number\" step=\"0.1\" min=\"0\" max=\"100\" name=\"max_exposure\" value=\"{max_exposure_val}\" placeholder=\"25\"></label>
+            <label>Player exposure caps<textarea name=\"player_caps\" rows=\"2\" placeholder=\"player_id=25, other_id=15\">{player_caps_val}</textarea></label>
             <button type=\"submit\">Apply</button>
             {hidden_site}
             {hidden_sport}
@@ -2676,6 +2742,8 @@ def create_app() -> FastAPI:
             limit=max(1, min(500, request_model.limit or 20)),
             sort_by=request_model.sort_by,
             sort_direction=request_model.sort_direction,
+            max_player_exposure=request_model.max_player_exposure,
+            player_exposure_caps=tuple(sorted((player_id, value) for player_id, value in (request_model.player_exposure_caps or {}).items())),
         )
 
         filter_result = filter_lineups(candidates, filter_criteria)

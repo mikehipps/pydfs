@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from statistics import fmean, median, pstdev
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal, Mapping, Sequence
 
 from pydfs.api.schemas.lineup import LineupResponse
 
@@ -48,6 +49,8 @@ class FilterCriteria:
     limit: int | None = None
     sort_by: Literal["baseline", "projection", "salary", "usage", "uniqueness"] = "baseline"
     sort_direction: Literal["asc", "desc"] = "desc"
+    max_player_exposure: float | None = None
+    player_exposure_caps: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -187,8 +190,40 @@ def filter_lineups(
     )
 
     selected_candidates = filtered_candidates
-    if criteria.limit is not None and criteria.limit > 0:
-        selected_candidates = filtered_candidates[: criteria.limit]
+    limit = criteria.limit if criteria.limit is not None and criteria.limit > 0 else None
+
+    global_cap = criteria.max_player_exposure
+    player_caps = dict(criteria.player_exposure_caps)
+
+    if global_cap is not None or player_caps:
+        exposure_counts: Counter[str] = Counter()
+        target_total = limit or len(filtered_candidates) or 0
+        target_total = max(target_total, 1)
+        selected_candidates = []
+        for candidate in filtered_candidates:
+            if limit is not None and len(selected_candidates) >= limit:
+                break
+
+            if _violates_cap_limit(
+                candidate,
+                exposure_counts,
+                global_cap,
+                player_caps,
+                target_total,
+            ):
+                continue
+
+            selected_candidates.append(candidate)
+            for player in candidate.lineup.players:
+                exposure_counts[player.player_id] += 1
+
+        selected_candidates = _enforce_final_caps(
+            selected_candidates,
+            global_cap,
+            player_caps,
+        )
+    elif limit is not None:
+        selected_candidates = filtered_candidates[:limit]
 
     ranked: list[FilteredLineup] = [
         FilteredLineup(candidate=candidate, rank=index)
@@ -205,6 +240,68 @@ def filter_lineups(
     )
 
     return FilterResult(lineups=ranked, summary=filtered_summary, pool_summary=pool_summary)
+
+
+def _violates_cap_limit(
+    candidate: LineupCandidate,
+    counts: Counter[str],
+    global_cap: float | None,
+    player_caps: Mapping[str, float],
+    target_total: int,
+) -> bool:
+    if target_total <= 0:
+        return False
+
+    for player in candidate.lineup.players:
+        cap = player_caps.get(player.player_id, global_cap)
+        if cap is None:
+            continue
+        allowed = cap * target_total
+        if counts[player.player_id] + 1 > allowed + 1e-9:
+            return True
+    return False
+
+
+def _enforce_final_caps(
+    selected: list[LineupCandidate],
+    global_cap: float | None,
+    player_caps: Mapping[str, float],
+) -> list[LineupCandidate]:
+    if not selected:
+        return selected
+
+    while selected:
+        counts: Counter[str] = Counter()
+        for candidate in selected:
+            for player in candidate.lineup.players:
+                counts[player.player_id] += 1
+
+        total = len(selected)
+        violation_player: str | None = None
+        for player_id, count in counts.items():
+            cap = player_caps.get(player_id, global_cap)
+            if cap is None:
+                continue
+            allowed = cap * total
+            if count > allowed + 1e-9:
+                violation_player = player_id
+                break
+
+        if violation_player is None:
+            break
+
+        removed = False
+        for idx in range(len(selected) - 1, -1, -1):
+            lineup = selected[idx]
+            if any(player.player_id == violation_player for player in lineup.lineup.players):
+                selected.pop(idx)
+                removed = True
+                break
+
+        if not removed:
+            break
+
+    return selected
 
 
 __all__ = [

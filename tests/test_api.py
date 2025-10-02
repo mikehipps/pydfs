@@ -5,6 +5,8 @@ from httpx import ASGITransport, AsyncClient
 from uuid import uuid4
 
 from pydfs.api import create_app
+from pydfs.api.schemas.lineup import LineupPlayerResponse, LineupResponse
+from pydfs.pool.filtering import FilterCriteria, LineupCandidate, filter_lineups
 
 
 @pytest.fixture(scope="module")
@@ -56,6 +58,48 @@ Ted End,DEN,$5800,11.0,7.5
 Luke Flex,NYJ,$5500,8.5,6.0
 Bengals Defense,CIN,$4000,5.0,4.0
 """
+
+
+def _candidate(
+    lineup_id: str,
+    players: list[str],
+    baseline: float,
+    run_ids: tuple[str, ...] = ("run",),
+) -> LineupCandidate:
+    lineup = LineupResponse(
+        lineup_id=lineup_id,
+        salary=50000,
+        projection=baseline,
+        baseline_projection=baseline,
+        players=[
+            LineupPlayerResponse(
+                player_id=player_id,
+                name=f"Player {player_id}",
+                team="TEAM",
+                positions=["POS"],
+                salary=5000,
+                projection=baseline,
+                ownership=None,
+                baseline_projection=baseline,
+            )
+            for player_id in players
+        ],
+    )
+    signature = tuple(sorted(players))
+    return LineupCandidate(
+        signature=signature,
+        lineup=lineup,
+        count=1,
+        run_ids=run_ids,
+        salary=lineup.salary,
+        projection=lineup.projection,
+        baseline=baseline,
+        usage_sum=0.0,
+        uniqueness=1.0,
+        baseline_percentile=0.0,
+        usage_percentile=0.0,
+        uniqueness_percentile=0.0,
+    )
 @pytest.mark.anyio
 async def test_health(client: AsyncClient):
     resp = await client.get("/health")
@@ -266,12 +310,43 @@ async def test_lineup_pool_page(client: AsyncClient):
     resp_shortcut = await client.get("/ui/pool/nfl/fd")
     assert resp_shortcut.status_code == 200
     assert "Lineup Pool" in resp_shortcut.text
-    assert f"value=\"{latest_slate.slate_id}\"" in resp_shortcut.text
+    assert f"value=\"{latest_slate.slate_id}\" selected" in resp_shortcut.text
 
     resp_sport_only = await client.get("/ui/pool/nfl")
     assert resp_sport_only.status_code == 200
     assert "Lineup Pool" in resp_sport_only.text
     assert "Current Slate" in resp_sport_only.text
+
+
+def test_filter_lineups_applies_max_exposure_cap():
+    candidates = [
+        _candidate("L1", ["A", "B"], 100),
+        _candidate("L2", ["A", "C"], 95),
+        _candidate("L3", ["D", "E"], 90),
+    ]
+    criteria = FilterCriteria(limit=2, max_player_exposure=0.5)
+    result = filter_lineups(candidates, criteria)
+
+    selected_ids = [item.candidate.lineup.lineup_id for item in result.lineups]
+    assert selected_ids == ["L1", "L3"], "Lineups exceeding exposure cap should be skipped"
+
+    exposure_counts: dict[str, int] = {}
+    for lineup in result.lineups:
+        for player in lineup.candidate.lineup.players:
+            exposure_counts[player.player_id] = exposure_counts.get(player.player_id, 0) + 1
+    assert all(count <= 1 for count in exposure_counts.values())
+
+
+def test_filter_lineups_respects_player_specific_caps():
+    candidates = [
+        _candidate("L1", ["A", "B"], 100),
+        _candidate("L2", ["C", "D"], 95),
+    ]
+    criteria = FilterCriteria(limit=2, player_exposure_caps=(("A", 0.0),))
+    result = filter_lineups(candidates, criteria)
+
+    selected_ids = [item.candidate.lineup.lineup_id for item in result.lineups]
+    assert selected_ids == ["L2"], "Lineups containing capped players should be excluded"
 
 
 @pytest.mark.anyio

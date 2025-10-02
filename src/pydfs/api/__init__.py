@@ -28,7 +28,7 @@ from pydfs.api.schemas import (
     LineupRequest,
     LineupResponse,
     MappingPreviewResponse,
-    PlayerUsageResponse,
+  PlayerUsageResponse,
     PoolFilterRequest,
     PoolFilterResponse,
     PoolFilteredLineup,

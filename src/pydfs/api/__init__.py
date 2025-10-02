@@ -28,7 +28,7 @@ from pydfs.api.schemas import (
     LineupRequest,
     LineupResponse,
     MappingPreviewResponse,
-    PlayerUsageResponse,
+  PlayerUsageResponse,
     PoolFilterRequest,
     PoolFilterResponse,
     PoolFilteredLineup,
@@ -41,7 +41,7 @@ from pydfs.optimizer import LineupGenerationPartial, build_lineups
 from pydfs.persistence import RunJob, RunRecord, RunStore, SlateRecord
 from pydfs.pool import FilterCriteria, export_lineups_to_csv, filter_lineups
 from pydfs.pool.export import ContestExportError
-from pydfs.pool.filtering import LineupCandidate
+from pydfs.pool.filtering import FilteredLineup, LineupCandidate
 
 
 DEFAULT_PLAYERS_MAPPING = {
@@ -129,6 +129,18 @@ def _calculate_player_usage(lineups: list[LineupResponse]) -> list[PlayerUsageRe
         )
         for player_id, data in sorted_usage
     ]
+
+
+def _calculate_filtered_player_usage(
+    selections: Sequence[LineupCandidate] | Sequence[FilteredLineup],
+) -> list[PlayerUsageResponse]:
+    """Compute player usage for a selection of unique lineups."""
+
+    lineups: list[LineupResponse] = []
+    for item in selections:
+        candidate = item.candidate if isinstance(item, FilteredLineup) else item
+        lineups.append(candidate.lineup)
+    return _calculate_player_usage(lineups)
 
 
 def _report_to_mapping(report: MappingPreviewResponse | MergeReport | dict) -> MappingPreviewResponse:
@@ -1405,6 +1417,8 @@ def _render_lineup_pool_page(
             return "-"
         return f"{value:.{precision}f}"
 
+    filtered_usage = _calculate_filtered_player_usage(filter_result.lineups)
+
     lineups_html, _ = _render_top_lineups(
         lineup_groups,
         lineup_metrics,
@@ -1413,20 +1427,25 @@ def _render_lineup_pool_page(
         descriptor="baseline projection",
     )
 
-    usage_rows = "".join(
-        f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td><td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
-        for item in usage
-    ) or "<tr><td colspan=5>No lineups available.</td></tr>"
+    def _render_usage_section(title: str, items: Sequence[PlayerUsageResponse]) -> str:
+        rows = "".join(
+            f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td><td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
+            for item in items
+        ) or "<tr><td colspan=5>No lineups available.</td></tr>"
+        return f"""
+        <section>
+            <h2>{title}</h2>
+            <table>
+                <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </section>
+        """
 
-    usage_table = f"""
-    <section>
-        <h2>Player Usage (All Runs)</h2>
-        <table>
-            <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
-            <tbody>{usage_rows}</tbody>
-        </table>
-    </section>
-    """
+    usage_table = _render_usage_section("Player Usage (All Runs)", usage)
+    filtered_usage_table = _render_usage_section(
+        "Player Usage (Filtered Selection)", filtered_usage
+    )
 
     display_top1_count = max(top1_count, 1)
     summary_rows = "".join(
@@ -1705,7 +1724,15 @@ def _render_lineup_pool_page(
         </section>
         """
 
-    sections = [filter_form, slate_info_html, summary_section, filtered_summary_section, filtered_table_section, export_button_html]
+    sections = [
+        filter_form,
+        slate_info_html,
+        summary_section,
+        filtered_summary_section,
+        filtered_usage_table,
+        filtered_table_section,
+        export_button_html,
+    ]
 
     if total_lineups == 0:
         sections.append("<p>No lineups have been generated yet for the selected filters.</p>")
@@ -2629,7 +2656,7 @@ def create_app() -> FastAPI:
         filtered_runs = filtered_runs[:limit]
 
         baseline_lookup = _baseline_lookup_for_pool(selected_slate, filtered_runs)
-        _analysis, candidates = _prepare_pool_analysis(filtered_runs, baseline_lookup=baseline_lookup)
+        analysis, candidates = _prepare_pool_analysis(filtered_runs, baseline_lookup=baseline_lookup)
 
         filter_criteria = FilterCriteria(
             min_baseline=request_model.min_baseline,
@@ -2652,6 +2679,9 @@ def create_app() -> FastAPI:
         )
 
         filter_result = filter_lineups(candidates, filter_criteria)
+
+        pool_usage_payload = list(analysis.get("usage", []))
+        filtered_usage_payload = _calculate_filtered_player_usage(filter_result.lineups)
 
         summary_payload = PoolFilterSummary(
             available_lineups=filter_result.summary.available_lineups,
@@ -2696,6 +2726,8 @@ def create_app() -> FastAPI:
             summary=summary_payload,
             pool_summary=pool_summary_payload,
             lineups=lineups_payload,
+            pool_usage=pool_usage_payload,
+            filtered_usage=filtered_usage_payload,
         )
 
     @app.get("/pool/export.csv")

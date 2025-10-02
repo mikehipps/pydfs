@@ -107,3 +107,5 @@ class PoolFilterResponse(BaseModel):
     pool_summary: PoolFilterSummary
     summary: PoolFilterSummary
     lineups: List[PoolFilteredLineup]
+    pool_usage: List[PlayerUsageResponse]
+    filtered_usage: List[PlayerUsageResponse]

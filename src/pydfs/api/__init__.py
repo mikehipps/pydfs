@@ -110,9 +110,17 @@ def _calculate_player_usage(lineups: list[LineupResponse]) -> list[PlayerUsageRe
                     "team": player.team,
                     "positions": tuple(player.positions),
                     "count": 0,
+                    "baseline_total": 0.0,
+                    "projection_total": 0.0,
                 },
             )
             entry["count"] = int(entry["count"]) + 1
+            entry["baseline_total"] = float(entry.get("baseline_total", 0.0)) + float(
+                player.baseline_projection
+            )
+            entry["projection_total"] = float(entry.get("projection_total", 0.0)) + float(
+                player.projection
+            )
 
     sorted_usage = sorted(
         usage.items(),
@@ -126,6 +134,16 @@ def _calculate_player_usage(lineups: list[LineupResponse]) -> list[PlayerUsageRe
             positions=list(data["positions"]),
             count=int(data["count"]),
             exposure=int(data["count"]) / total_lineups,
+            baseline_projection=(
+                float(data.get("baseline_total", 0.0)) / int(data["count"])
+                if int(data["count"]) > 0
+                else 0.0
+            ),
+            projection=(
+                float(data.get("projection_total", 0.0)) / int(data["count"])
+                if int(data["count"]) > 0
+                else 0.0
+            ),
         )
         for player_id, data in sorted_usage
     ]
@@ -1293,14 +1311,15 @@ def _render_run_detail_page(run: RunRecord) -> str:
 
     usage_rows = "".join(
         f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td>"
-        f"<td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
+        f"<td>{item.count}</td><td>{item.exposure * 100:.1f}%</td>"
+        f"<td>{item.baseline_projection:.2f}</td><td>{item.projection:.2f}</td></tr>"
         for item in usage
-    ) or "<tr><td colspan=5>No lineups generated.</td></tr>"
+    ) or "<tr><td colspan=7>No lineups generated.</td></tr>"
     usage_table = f"""
     <section>
         <h2>Player Usage</h2>
         <table>
-            <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
+            <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th><th>Baseline Proj</th><th>Final Biased Projection</th></tr></thead>
             <tbody>{usage_rows}</tbody>
         </table>
     </section>
@@ -1491,14 +1510,16 @@ def _render_lineup_pool_page(
 
     def _render_usage_section(title: str, items: Sequence[PlayerUsageResponse]) -> str:
         rows = "".join(
-            f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td><td>{item.count}</td><td>{item.exposure * 100:.1f}%</td></tr>"
+            f"<tr><td>{escape(item.name)}</td><td>{escape(item.team)}</td><td>{'/'.join(item.positions)}</td>"
+            f"<td>{item.count}</td><td>{item.exposure * 100:.1f}%</td>"
+            f"<td>{item.baseline_projection:.2f}</td><td>{item.projection:.2f}</td></tr>"
             for item in items
-        ) or "<tr><td colspan=5>No lineups available.</td></tr>"
+        ) or "<tr><td colspan=7>No lineups available.</td></tr>"
         return f"""
         <section>
             <h2>{title}</h2>
             <table>
-                <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th></tr></thead>
+                <thead><tr><th>Player</th><th>Team</th><th>Positions</th><th>Lineups</th><th>Usage</th><th>Baseline Proj</th><th>Final Biased Projection</th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
         </section>

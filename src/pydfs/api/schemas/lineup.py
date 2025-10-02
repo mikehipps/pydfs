@@ -50,6 +50,8 @@ class PlayerUsageResponse(BaseModel):
     positions: List[str]
     count: int
     exposure: float
+    baseline_projection: float
+    projection: float
 
 
 class PoolFilterRequest(BaseModel):

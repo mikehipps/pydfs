@@ -2259,6 +2259,7 @@ def create_app() -> FastAPI:
         site = slate_inputs["resolved_site"]
         sport = slate_inputs["resolved_sport"]
         records: list[PlayerRecord] = slate_inputs["records"]
+        raw_records: list[PlayerRecord] = slate_inputs["raw_records"]
         mapping_report: MappingPreviewResponse = slate_inputs["report"]
         slate_obj = slate_inputs["slate"]
         effective_players_mapping = slate_inputs["effective_players_mapping"]

@@ -61,3 +61,5 @@ Keep this file updated after each significant change set.
 - **Slate-centric pool view**: Lineup pool filters now pivot on stored slates (with friendly names), shows slate metadata, and exposes a projections-replacement flow that re-merges the slate and rescales the pool without generating new lineups.
 - **Pool defaults**: `/ui/pool`, `/ui/pool/<sport>`, and `/ui/pool/<sport>/<site>` automatically load the most recent slate for their scope (overall, sport, sport+site) while keeping a dropdown to switch slates; tests cover the new defaults.
 - **Usage-aware randomness**: Optimizer now biases projections on the fly based on cumulative usage—players trending under target exposure get positive boosts while over-used cores get tapered. Bias strength/target are configurable via API/CLI/UI, metadata is persisted with each run, and tests cover the new helpers.
+
+sample -- delete later

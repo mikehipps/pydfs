@@ -62,4 +62,43 @@ Keep this file updated after each significant change set.
 - **Pool defaults**: `/ui/pool`, `/ui/pool/<sport>`, and `/ui/pool/<sport>/<site>` automatically load the most recent slate for their scope (overall, sport, sport+site) while keeping a dropdown to switch slates; tests cover the new defaults.
 - **Usage-aware randomness**: Optimizer now biases projections on the fly based on cumulative usage—players trending under target exposure get positive boosts while over-used cores get tapered. Bias strength/target are configurable via API/CLI/UI, metadata is persisted with each run, and tests cover the new helpers.
 
-sample -- delete later
+## Immediate Focus: Lineup Pool Filtering, Export, and Hand Builder
+
+The current docs highlight rich pool summaries (usage metrics, rescoring, slate awareness) but we still lack tooling to curate
+and ship lineups once they're generated. Prioritise the following track so the workflow progresses from "generate" to "deploy":
+
+1. **Baseline data audit**
+   - Confirm the `RunStore`/`SlateStore` payloads already persisted for pool views (usage tables, rescored projections, slate
+     metadata). Surface any missing attributes required for filtering (e.g., cumulative ownership, salary span, stack tags) so we
+     know whether to extend the solver metadata or derive them post-hoc.
+   - Catalogue the contest CSV schemas we care about first (e.g., FD single-entry vs. MME) and note any fields not present in the
+     stored lineup representation.
+
+2. **Server-side filtering contract**
+   - Add API endpoints (or extend `/ui/pool` handlers) that accept filter parameters: projection/ceiling ranges, ownership caps,
+     overlap limits, team/game filters, salary buckets, min/max player exposures, etc.
+   - Reuse the existing rescored lineup payload so filters act on up-to-date projections; ensure responses keep both summary stats
+     and the filtered lineup list to feed UI + exports.
+   - Introduce a lightweight query object (or pydantic model) to keep validation consistent across API/UI and future CLI usage.
+
+3. **UI workflow**
+   - Expand the pool page with a filtering sidebar (form submission first; progressive enhancement with HTMX/JS later). Display
+     result counts, aggregate stats (mean projection, ownership sums), and allow multi-select for export.
+   - Provide quick presets (e.g., "Highest projection", "Balanced ownership", "Bring-backs") powered by saved filter configs.
+   - Surface per-lineup affordances for the hand builder: lock players, clone to manual editor, mark favorites.
+
+4. **Export pipeline**
+   - Implement contest-specific CSV serializers that map our lineup model to required columns (player IDs, captain flag, flex
+     slots). Include validations so users can't export mis-sized rosters.
+   - Wire exports to both UI (download button) and CLI/script flows. Logging should reference the slate, run ID, filters applied,
+     and timestamp for auditability.
+
+5. **Hand builder foundation**
+   - Back the manual builder with the same slate data (player projections, ownership, salary) and expose helper endpoints to
+     suggest completions or validate partial rosters.
+   - Allow users to lock players, see remaining salary/slots, and optionally request "fill recommendations" using the optimizer
+     with locks enforced. Persist manual lineups alongside generated ones for export parity.
+
+6. **Follow-up hygiene**
+   - Document contest templates and filter presets in `README` once implemented.
+   - Add end-to-end tests (API + UI) that cover a filter → export cycle to prevent regressions.

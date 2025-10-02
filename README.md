@@ -21,11 +21,12 @@ pip install -e .[dev]
 
 ## Next steps
 
-1. Flesh out the canonical domain models (players, slates, constraints) under `src/pydfs/models/`.
-2. Wrap `pydfs-lineup-optimizer` behind a service module to keep business logic isolated from the third-party API.
-3. Port MLB ingestion, then expand to NFL/NBA via adapter modules that emit the shared schema.
-4. Layer on persistence / API / UI pieces once the core optimizer contract is stable.
+1. Productise the lineup pool: expose robust filtering, selection, and export flows (UI + API) so generated runs can ship
+   directly to contest CSVs.
+2. Solidify core models (`players`, `slates`, `constraints`) under `src/pydfs/models/` and ensure they're reused by the solver,
+   persistence, and export layers.
+3. Expand ingestion adapters beyond the current sport/site defaults while keeping projections + injury data normalised across
+   slates.
+4. Continue layering persistence / API / UI improvements once the optimizer contract and export pipeline are stable.
 
 Tracking work in issues / ADRs up front will help keep multi-sport support consistent as we grow.
-
-_Temporary sync test note – safe to remove once verified._

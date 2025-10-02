@@ -152,6 +152,7 @@ async def test_lineups_with_stored_slate(client: AsyncClient):
     first_payload = resp.json()
     slate_id = first_payload.get("slate_id")
     assert slate_id, "First run should store a slate"
+    store = client.app.state.run_store
     slate_record = store.get_slate(slate_id)
     assert slate_record is not None
     assert slate_record.bias_factors
@@ -334,3 +335,44 @@ async def test_reset_slate_bias(client: AsyncClient):
     slate_after = store.get_slate(slate_id)
     assert slate_after is not None
     assert slate_after.bias_factors == {}
+
+
+@pytest.mark.anyio
+async def test_pool_filter_and_export(client: AsyncClient):
+    files = {
+        "projections": ("projections.csv", _sample_projections(), "text/csv"),
+        "players": ("players.csv", _sample_players(), "text/csv"),
+    }
+    data = {
+        "lineup_request": "{\"lineups\": 3}",
+        "projection_mapping": "{\"name\": \"player\", \"team\": \"team\", \"salary\": \"salary\", \"projection\": \"fantasy\", \"ownership\": \"proj_own\"}",
+    }
+    run_resp = await client.post("/lineups", files=files, data=data)
+    run_resp.raise_for_status()
+    run_payload = run_resp.json()
+    slate_id = run_payload.get("slate_id")
+    assert slate_id
+
+    filter_request = {
+        "slate_id": slate_id,
+        "site": "FD",
+        "sport": "NFL",
+        "limit": 3,
+        "include_player_ids": ["1"],
+    }
+    filter_resp = await client.post("/pool/filter", json=filter_request)
+    filter_resp.raise_for_status()
+    body = filter_resp.json()
+    assert body["summary"]["available_lineups"] >= 1
+    assert body["lineups"], "Filtered lineups should not be empty"
+    first_lineup = body["lineups"][0]
+    assert first_lineup["players"], "Lineup payload should include players"
+
+    export_url = f"/pool/export.csv?slate_id={slate_id}&include_players=1&filter_limit=2"
+    export_resp = await client.get(export_url)
+    export_resp.raise_for_status()
+    lines = [line for line in export_resp.text.strip().splitlines() if line]
+    assert lines, "Export CSV should contain data"
+    header = lines[0].split(",")
+    assert header[0] == "EntryName"
+    assert any(cell.startswith("QB") for cell in header[1:])

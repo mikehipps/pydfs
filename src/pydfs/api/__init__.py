@@ -1375,24 +1375,20 @@ def _render_lineup_pool_page(
     unique_lineups = len(lineup_groups)
 
     if baseline_scores:
-        mean_score = statistics.fmean(baseline_scores)
-        median_score = statistics.median(baseline_scores)
-        std_score = statistics.pstdev(baseline_scores) if len(baseline_scores) > 1 else 0.0
         sorted_scores = sorted(baseline_scores, reverse=True)
         top10_count = max(1, int(len(sorted_scores) * 0.10))
         top1_count = max(1, int(len(sorted_scores) * 0.01))
         top10_avg = sum(sorted_scores[:top10_count]) / top10_count
         top1_avg = sum(sorted_scores[:top1_count]) / top1_count
     else:
-        mean_score = median_score = std_score = top10_avg = top1_avg = 0.0
+        top10_avg = top1_avg = 0.0
         top10_count = top1_count = 0
 
     if lineup_usage_sums:
-        usage_mean = statistics.fmean(lineup_usage_sums)
         usage_median = statistics.median(lineup_usage_sums)
         usage_std = statistics.pstdev(lineup_usage_sums) if len(lineup_usage_sums) > 1 else 0.0
     else:
-        usage_mean = usage_median = usage_std = 0.0
+        usage_median = usage_std = 0.0
 
     if lineup_uniqueness_scores:
         uniqueness_mean = statistics.fmean(lineup_uniqueness_scores)
@@ -1402,6 +1398,12 @@ def _render_lineup_pool_page(
         uniqueness_mean = uniqueness_median = uniqueness_std = 0.0
 
     filter_result = filter_lineups(candidates, filter_criteria)
+    pool_summary = filter_result.pool_summary
+
+    def _fmt_float(value: float | None, precision: int = 2) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.{precision}f}"
 
     lineups_html, _ = _render_top_lineups(
         lineup_groups,
@@ -1430,15 +1432,16 @@ def _render_lineup_pool_page(
     summary_rows = "".join(
         [
             f"<tr><th>Runs included</th><td>{total_runs}</td></tr>",
-            f"<tr><th>Total lineups</th><td>{total_lineups}</td></tr>",
+            f"<tr><th>Total lineup instances</th><td>{pool_summary.total_instances}</td></tr>",
             f"<tr><th>Unique lineups</th><td>{unique_lineups}</td></tr>",
             f"<tr><th>Unique players</th><td>{len(unique_players_used)}</td></tr>",
-            f"<tr><th>Mean baseline projection</th><td>{mean_score:.2f}</td></tr>",
-            f"<tr><th>Median baseline projection</th><td>{median_score:.2f}</td></tr>",
-            f"<tr><th>Baseline std. dev.</th><td>{std_score:.2f}</td></tr>",
+            f"<tr><th>Mean baseline projection</th><td>{_fmt_float(pool_summary.baseline_mean)}</td></tr>",
+            f"<tr><th>Median baseline projection</th><td>{_fmt_float(pool_summary.baseline_median)}</td></tr>",
+            f"<tr><th>Baseline std. dev.</th><td>{_fmt_float(pool_summary.baseline_std)}</td></tr>",
             f"<tr><th>Top 10% average ({top10_count} lineups)</th><td>{top10_avg:.2f}</td></tr>",
             f"<tr><th>Top 1% average ({display_top1_count} lineup{'s' if display_top1_count != 1 else ''})</th><td>{top1_avg:.2f}</td></tr>",
-            f"<tr><th>Mean usage sum</th><td>{usage_mean:.1f}%</td></tr>",
+            f"<tr><th>Mean perturbed projection</th><td>{_fmt_float(pool_summary.projection_mean)}</td></tr>",
+            f"<tr><th>Mean usage sum</th><td>{_fmt_float(pool_summary.usage_mean, 1)}%</td></tr>",
             f"<tr><th>Median usage sum</th><td>{usage_median:.1f}%</td></tr>",
             f"<tr><th>Usage std. dev.</th><td>{usage_std:.1f}%</td></tr>",
             f"<tr><th>Mean uniqueness</th><td>{_format_large(uniqueness_mean)}</td></tr>",
@@ -1452,7 +1455,7 @@ def _render_lineup_pool_page(
         range_note += f" • Slate: {escape(selected_slate.name or 'Unnamed')}"
     summary_section = f"""
     <section>
-        <h2>Lineup Pool Summary</h2>
+        <h2>Pool Summary</h2>
         <p>Range: {range_note}</p>
         <table>
             {summary_rows}
@@ -1461,11 +1464,6 @@ def _render_lineup_pool_page(
     """
 
     filtered_summary = filter_result.summary
-
-    def _fmt_float(value: float | None, precision: int = 2) -> str:
-        if value is None:
-            return "-"
-        return f"{value:.{precision}f}"
 
     filtered_summary_rows = "".join(
         [
@@ -1707,7 +1705,7 @@ def _render_lineup_pool_page(
         </section>
         """
 
-    sections = [filter_form, slate_info_html, filtered_summary_section, filtered_table_section, export_button_html]
+    sections = [filter_form, slate_info_html, summary_section, filtered_summary_section, filtered_table_section, export_button_html]
 
     if total_lineups == 0:
         sections.append("<p>No lineups have been generated yet for the selected filters.</p>")
@@ -1716,7 +1714,6 @@ def _render_lineup_pool_page(
 
     sections.extend(
         [
-            summary_section,
             usage_table,
             runs_section,
             f"<section><h2>Top Lineups</h2>{lineups_html}</section>",

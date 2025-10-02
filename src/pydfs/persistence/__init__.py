@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Mapping
 from uuid import uuid4
 
 
@@ -55,6 +55,8 @@ class SlateRecord:
     report: dict
     players_mapping: dict
     projection_mapping: dict
+    bias_factors: dict
+    bias_summary: dict | None
 
 
 class RunStore:
@@ -156,10 +158,20 @@ class RunStore:
                 players_mapping_json TEXT NOT NULL,
                 projection_mapping_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                bias_json TEXT,
+                bias_summary_json TEXT
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE slates ADD COLUMN bias_json TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE slates ADD COLUMN bias_summary_json TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
     def save_run(
@@ -299,9 +311,13 @@ class RunStore:
         players_mapping: dict,
         projection_mapping: dict,
         slate_id: Optional[str] = None,
+        bias_factors: Mapping[str, float] | None = None,
+        bias_summary: dict | None = None,
     ) -> SlateRecord:
         slate_id = slate_id or uuid4().hex
         now = datetime.now(timezone.utc)
+        bias_json = json.dumps(dict(bias_factors or {}))
+        bias_summary_json = json.dumps(bias_summary or {})
         payload = (
             slate_id,
             site,
@@ -317,6 +333,8 @@ class RunStore:
             json.dumps(projection_mapping),
             now.isoformat(),
             now.isoformat(),
+            bias_json,
+            bias_summary_json,
         )
         with self._connect() as conn:
             conn.execute(
@@ -324,8 +342,9 @@ class RunStore:
                 INSERT INTO slates (
                     id, site, sport, name, players_filename, projections_filename,
                     players_csv, projections_csv, records_json, report_json,
-                    players_mapping_json, projection_mapping_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    players_mapping_json, projection_mapping_json, created_at, updated_at,
+                    bias_json, bias_summary_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -348,6 +367,8 @@ class RunStore:
         report: dict | None = None,
         players_mapping: dict | None = None,
         projection_mapping: dict | None = None,
+        bias_factors: Mapping[str, float] | None = None,
+        bias_summary: dict | None = None,
     ) -> SlateRecord:
         slate = self.get_slate(slate_id)
         if slate is None:
@@ -364,6 +385,8 @@ class RunStore:
         updated_report = report if report is not None else slate.report
         updated_players_mapping = players_mapping if players_mapping is not None else slate.players_mapping
         updated_projection_mapping = projection_mapping if projection_mapping is not None else slate.projection_mapping
+        updated_bias = dict(bias_factors) if bias_factors is not None else dict(slate.bias_factors)
+        updated_bias_summary = bias_summary if bias_summary is not None else (slate.bias_summary or {})
 
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
@@ -379,6 +402,8 @@ class RunStore:
                     report_json = ?,
                     players_mapping_json = ?,
                     projection_mapping_json = ?,
+                    bias_json = ?,
+                    bias_summary_json = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -392,6 +417,8 @@ class RunStore:
                     json.dumps(updated_report),
                     json.dumps(updated_players_mapping),
                     json.dumps(updated_projection_mapping),
+                    json.dumps(updated_bias),
+                    json.dumps(updated_bias_summary),
                     now,
                     slate_id,
                 ),
@@ -411,6 +438,19 @@ class RunStore:
             if row is None:
                 return None
             return self._row_to_slate(row)
+
+    def update_slate_bias(
+        self,
+        slate_id: str,
+        *,
+        bias_factors: Mapping[str, float] | None,
+        bias_summary: dict | None,
+    ) -> SlateRecord:
+        return self.update_slate(
+            slate_id,
+            bias_factors=bias_factors or {},
+            bias_summary=bias_summary or {},
+        )
 
     def get_latest_slate(self, *, site: str | None = None, sport: str | None = None) -> Optional[SlateRecord]:
         query = "SELECT * FROM slates"
@@ -579,4 +619,6 @@ class RunStore:
             report=json.loads(row["report_json"]),
             players_mapping=json.loads(row["players_mapping_json"]),
             projection_mapping=json.loads(row["projection_mapping_json"]),
+            bias_factors=json.loads(row["bias_json"]) if row["bias_json"] else {},
+            bias_summary=json.loads(row["bias_summary_json"]) if row["bias_summary_json"] else None,
         )

@@ -30,19 +30,20 @@ def _sample_pool() -> list[PlayerRecord]:
 
 
 def test_build_lineups_generates_lineup():
-    lineups = build_lineups(
+    output = build_lineups(
         _sample_pool(),
         site="FD",
         sport="MLB",
         n_lineups=1,
     )
-
+    lineups = output.lineups
     assert len(lineups) == 1
     lineup = lineups[0]
     assert lineup.lineup_id == "L001"
     assert len(lineup.players) == 9
     total_salary = sum(player.salary for player in lineup.players)
     assert total_salary <= 35_000
+    assert output.bias_summary is None
 
 
 def test_build_lineups_respects_locks_and_excludes():
@@ -50,14 +51,16 @@ def test_build_lineups_respects_locks_and_excludes():
     locked = {"p2"}
     excluded = {"p1"}
 
-    lineup = build_lineups(
+    output = build_lineups(
         pool,
         site="FD",
         sport="MLB",
         n_lineups=1,
         lock_player_ids=locked,
         exclude_player_ids=excluded,
-    )[0]
+    )
+
+    lineup = output.lineups[0]
 
     ids = {player.player_id for player in lineup.players}
     assert "p1" not in ids

@@ -106,6 +106,7 @@ async def test_lineups_endpoint(client: AsyncClient):
     # Ownership should be parsed through mapping
     assert lineup["players"][0]["ownership"] is not None
     assert payload.get("slate_id")
+    assert payload.get("bias_summary") is not None
 
     run_id = payload["run_id"]
     resp = await client.get("/runs")
@@ -127,6 +128,7 @@ async def test_lineups_endpoint(client: AsyncClient):
     assert detail["request"]["exposure_bias_target"] == pytest.approx(50.0)
     assert detail["request"].get("slate_id")
     assert detail["request"].get("slate_projections_filename")
+    assert detail.get("bias_summary")
 
     resp = await client.post(f"/runs/{run_id}/rerun")
     assert resp.status_code == 200
@@ -150,6 +152,9 @@ async def test_lineups_with_stored_slate(client: AsyncClient):
     first_payload = resp.json()
     slate_id = first_payload.get("slate_id")
     assert slate_id, "First run should store a slate"
+    slate_record = store.get_slate(slate_id)
+    assert slate_record is not None
+    assert slate_record.bias_factors
 
     # Re-run without uploading files, using stored slate
     resp2 = await client.post(
@@ -163,10 +168,12 @@ async def test_lineups_with_stored_slate(client: AsyncClient):
     second_payload = resp2.json()
     assert second_payload["slate_id"] == slate_id
     assert len(second_payload["lineups"]) == 1
+    assert second_payload.get("bias_summary")
     detail_again = await client.get(f"/runs/{second_payload['run_id']}")
     detail_again.raise_for_status()
     run_detail = detail_again.json()
     assert run_detail["request"]["slate_id"] == slate_id
+    assert run_detail.get("bias_summary")
 
 
 @pytest.mark.anyio
@@ -198,6 +205,7 @@ async def test_lineups_with_custom_perturbation_ranges(client: AsyncClient):
     assert detail["request"].get("slate_id")
     assert detail["request"]["exposure_bias"] == pytest.approx(15.0)
     assert detail["request"]["exposure_bias_target"] == pytest.approx(35.0)
+    assert detail.get("bias_summary")
 
 
 @pytest.mark.anyio
@@ -299,3 +307,30 @@ async def test_update_slate_projections_from_pool(client: AsyncClient):
     assert follow_resp.status_code == 200
     assert "Projections updated" in follow_resp.text
     assert "updated.csv" in follow_resp.text
+
+
+@pytest.mark.anyio
+async def test_reset_slate_bias(client: AsyncClient):
+    files = {
+        "projections": ("projections.csv", _sample_projections(), "text/csv"),
+        "players": ("players.csv", _sample_players(), "text/csv"),
+    }
+    data = {
+        "lineup_request": json.dumps({"lineups": 1, "exposure_bias": 20, "exposure_bias_target": 30}),
+    }
+    resp = await client.post("/lineups", files=files, data=data)
+    resp.raise_for_status()
+    slate_id = resp.json()["slate_id"]
+    store = client.app.state.run_store
+    slate = store.get_slate(slate_id)
+    assert slate and slate.bias_factors
+
+    reset_resp = await client.post(
+        f"/slates/{slate_id}/reset-bias",
+        data={"redirect": "/ui"},
+        follow_redirects=False,
+    )
+    assert reset_resp.status_code == 303
+    slate_after = store.get_slate(slate_id)
+    assert slate_after is not None
+    assert slate_after.bias_factors == {}

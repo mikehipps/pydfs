@@ -430,6 +430,22 @@ def _coerce_percentage_value(value: float | None) -> float | None:
     return value * 100.0 if value <= 1.0 else value
 
 
+def _apply_bias_to_player_records(records: list[PlayerRecord], bias_map: Mapping[str, float]) -> list[PlayerRecord]:
+    if not bias_map:
+        return list(records)
+    biased: list[PlayerRecord] = []
+    for record in records:
+        factor = float(bias_map.get(record.player_id, 1.0))
+        factor = max(0.0, factor)
+        new_projection = max(0.0, record.projection * factor)
+        metadata = dict(record.metadata)
+        metadata.setdefault("baseline_projection", float(metadata.get("baseline_projection", record.projection)))
+        metadata["bias_factor"] = factor
+        metadata["biased_projection"] = new_projection
+        biased.append(record.model_copy(update={"projection": new_projection, "metadata": metadata}))
+    return biased
+
+
 def _render_index_page(
     runs: list[RunRecord],
     preview,
@@ -1018,6 +1034,46 @@ def _render_run_detail_page(run: RunRecord) -> str:
     max_repeating_display = "-" if max_repeating_display is None else str(max_repeating_display)
     min_salary_display = "-" if min_salary_display in (None, "") else str(min_salary_display)
 
+    bias_summary_data = run.request.get("bias_summary") if isinstance(run.request, dict) else None
+    bias_section = ""
+    slate_id_for_reset = run.request.get("slate_id") if isinstance(run.request, dict) else None
+    if bias_summary_data:
+        try:
+            min_factor = float(bias_summary_data.get("min_factor", 1.0))
+            max_factor = float(bias_summary_data.get("max_factor", 1.0))
+            target_percent = bias_summary_data.get("target_percent")
+            strength_percent = bias_summary_data.get("strength_percent")
+            lineups_tracked = bias_summary_data.get("lineups_tracked", 0)
+            factor_count = len(bias_summary_data.get("factors", {}))
+        except Exception:  # pragma: no cover - defensive parsing
+            min_factor = max_factor = 1.0
+            target_percent = strength_percent = None
+            lineups_tracked = factor_count = 0
+        reset_form = ""
+        if slate_id_for_reset:
+            reset_form = f"""
+            <form method=\"post\" action=\"/slates/{escape(slate_id_for_reset)}/reset-bias\" style=\"margin-top:0.75rem;\">
+                <input type=\"hidden\" name=\"redirect\" value=\"/ui/runs/{run.run_id}\">
+                <button type=\"submit\" class=\"secondary\">Remove accumulated bias</button>
+            </form>
+            """
+        target_display = "-" if target_percent is None else f"{target_percent:.1f}"
+        strength_display = "-" if strength_percent is None else f"{strength_percent:.1f}"
+        bias_section = f"""
+        <section>
+            <h2>Bias Summary</h2>
+            <table>
+                <tr><th>Min factor</th><td>{min_factor:.3f}</td></tr>
+                <tr><th>Max factor</th><td>{max_factor:.3f}</td></tr>
+                <tr><th>Target exposure (%)</th><td>{target_display}</td></tr>
+                <tr><th>Bias strength (%)</th><td>{strength_display}</td></tr>
+                <tr><th>Lineups tracked</th><td>{lineups_tracked}</td></tr>
+                <tr><th>Players tracked</th><td>{factor_count}</td></tr>
+            </table>
+            {reset_form}
+        </section>
+        """
+
     body = f"""
     <section>
         <h1>Run {run.run_id}</h1>
@@ -1036,6 +1092,7 @@ def _render_run_detail_page(run: RunRecord) -> str:
         </table>
     </section>
     {stats_html}
+    {bias_section}
     {usage_table}
     <section>
         <h2>Lineups</h2>
@@ -1556,6 +1613,8 @@ def create_app() -> FastAPI:
             exposure_bias_target = max_exposure * 100.0
 
         records: list[PlayerRecord] = slate_inputs["records"]
+        raw_records: list[PlayerRecord] = slate_inputs.get("raw_records", records)
+        raw_records: list[PlayerRecord] = slate_inputs.get("raw_records", records)
         mapping_report: MappingPreviewResponse = slate_inputs["report"]
         slate = slate_inputs["slate"]
         effective_players_mapping = slate_inputs["effective_players_mapping"]
@@ -1576,7 +1635,7 @@ def create_app() -> FastAPI:
 
         partial_message: str | None = None
         try:
-            lineups = build_lineups(
+            build_output = build_lineups(
                 records,
                 site=site,
                 sport=sport,
@@ -1594,12 +1653,15 @@ def create_app() -> FastAPI:
                 exposure_bias=exposure_bias,
                 exposure_bias_target=exposure_bias_target,
             )
+            lineups = build_output.lineups
+            bias_summary = build_output.bias_summary or {}
         except ValueError as exc:
             store.update_job_state(run_id, state="failed", message=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LineupGenerationPartial as exc:
             partial_message = exc.message
             lineups = exc.lineups
+            bias_summary = exc.bias_summary or {}
         except Exception as exc:  # pragma: no cover
             store.update_job_state(run_id, state="failed", message=str(exc))
             raise
@@ -1690,6 +1752,7 @@ def create_app() -> FastAPI:
                 "perturbation_p75": perturbation_p75,
                 "exposure_bias": exposure_bias,
                 "exposure_bias_target": exposure_bias_target,
+                "bias_summary": bias_summary,
                 "slate_id": slate_used.slate_id if slate_used else slate_id,
                 "slate_name": slate_used.name if slate_used else (slate_name or None),
                 "slate_players_filename": slate_used.players_filename if slate_used else (players.filename if players else None),
@@ -1704,6 +1767,13 @@ def create_app() -> FastAPI:
         if partial_message:
             store.update_job_state(run_id, state="completed", message=partial_message)
 
+        if slate_used and bias_summary is not None:
+            store.update_slate_bias(
+                slate_used.slate_id,
+                bias_factors=bias_summary.get("factors"),
+                bias_summary=bias_summary,
+            )
+
         response = LineupBatchResponse(
             run_id=run_id,
             report=mapping_report,
@@ -1711,6 +1781,7 @@ def create_app() -> FastAPI:
             player_usage=player_usage,
             message=partial_message,
             slate_id=slate_used.slate_id if slate_used else None,
+            bias_summary=bias_summary or None,
         )
         return response
 
@@ -1783,6 +1854,7 @@ def create_app() -> FastAPI:
             ),
             lineups=lineups,
             player_usage=_calculate_player_usage(lineups),
+            bias_summary=run.request.get("bias_summary") if isinstance(run.request, dict) else None,
         )
 
     @app.post("/runs/{run_id}/cancel")
@@ -2020,8 +2092,15 @@ def create_app() -> FastAPI:
             )
             report = _report_to_mapping(merge_report)
 
+        raw_records = list(records)
+        if slate and slate.bias_factors:
+            records = _apply_bias_to_player_records(raw_records, slate.bias_factors)
+        else:
+            records = list(records)
+
         return {
             "records": records,
+            "raw_records": raw_records,
             "report": report,
             "slate": slate,
             "effective_players_mapping": effective_players_mapping,
@@ -2097,6 +2176,15 @@ def create_app() -> FastAPI:
             error=error_msg,
         )
         return HTMLResponse(content)
+
+    @app.post("/slates/{slate_id}/reset-bias")
+    async def reset_slate_bias(slate_id: str, redirect: str | None = Form(None)):
+        target = redirect or "/ui"
+        try:
+            store.update_slate_bias(slate_id, bias_factors={}, bias_summary={})
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Slate not found")
+        return RedirectResponse(url=target, status_code=303)
 
     @app.post("/ui", response_class=HTMLResponse)
     async def ui_handle(
@@ -2200,8 +2288,9 @@ def create_app() -> FastAPI:
                     state="running",
                 )
                 partial_message = None
+                bias_summary: dict | None = None
                 try:
-                    built_lineups = build_lineups(
+                    build_output = build_lineups(
                         records,
                         site=site,
                         sport=sport,
@@ -2219,9 +2308,12 @@ def create_app() -> FastAPI:
                         exposure_bias=exposure_bias,
                         exposure_bias_target=exposure_bias_target,
                     )
+                    built_lineups = build_output.lineups
+                    bias_summary = build_output.bias_summary or {}
                 except LineupGenerationPartial as exc:
                     partial_message = exc.message
                     built_lineups = exc.lineups
+                    bias_summary = exc.bias_summary or {}
                     store.update_job_state(run_id, state="completed", message=exc.message)
                 except Exception as exc:
                     store.update_job_state(run_id, state="failed", message=str(exc))
@@ -2281,10 +2373,12 @@ def create_app() -> FastAPI:
                         projections_filename=projections_filename_to_store,
                         players_csv=players_csv_text,
                         projections_csv=projections_csv_text,
-                        records=[record.model_dump() for record in records],
+                        records=[record.model_dump() for record in raw_records],
                         report=mapping_report.model_dump(),
                         players_mapping=effective_players_mapping,
                         projection_mapping=effective_projection_mapping,
+                        bias_factors=bias_summary.get("factors") if bias_summary else None,
+                        bias_summary=bias_summary,
                     )
 
                 slate_used = new_slate or slate_obj
@@ -2305,6 +2399,7 @@ def create_app() -> FastAPI:
                         "perturbation_p75": perturbation_p75,
                         "exposure_bias": exposure_bias,
                         "exposure_bias_target": exposure_bias_target,
+                        "bias_summary": bias_summary,
                         "slate_id": slate_used.slate_id if slate_used else (slate_id.strip() if slate_id else None),
                         "slate_name": slate_used.name if slate_used else (slate_name or None),
                         "slate_players_filename": slate_used.players_filename if slate_used else (players.filename if players else None),
@@ -2316,6 +2411,13 @@ def create_app() -> FastAPI:
                     projection_mapping=effective_projection_mapping,
                 )
 
+                if slate_used and bias_summary is not None:
+                    store.update_slate_bias(
+                        slate_used.slate_id,
+                        bias_factors=bias_summary.get("factors"),
+                        bias_summary=bias_summary,
+                    )
+
                 success = f"Run saved with ID {run_id}"
                 if partial_message:
                     success = f"Partial run saved with ID {run_id}"
@@ -2326,6 +2428,7 @@ def create_app() -> FastAPI:
                         "usage_lookup": usage_lookup_mapping,
                         "min_salary": min_salary,
                         "slate_id": slate_used.slate_id if slate_used else None,
+                        "bias_summary": bias_summary,
                     }
                 redirect_url = f"/ui/runs/{run_id}"
         except ValueError as exc:

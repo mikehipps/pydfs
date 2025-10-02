@@ -191,7 +191,7 @@ def main() -> None:
         lineups_per_job = max(1, lineups_per_job)
 
     try:
-        lineups = build_lineups(
+        build_output = build_lineups(
             records,
             site=args.site,
             sport=args.sport,
@@ -209,6 +209,17 @@ def main() -> None:
             exposure_bias=args.exposure_bias,
             exposure_bias_target=args.exposure_bias_target,
         )
+        lineups = build_output.lineups
+        if build_output.bias_summary:
+            summary = build_output.bias_summary
+            print(
+                "Bias summary: min={:.3f} max={:.3f} target={} strength={:.1f}%".format(
+                    summary.get("min_factor", 1.0),
+                    summary.get("max_factor", 1.0),
+                    summary.get("target_percent"),
+                    summary.get("strength_percent", 0.0),
+                )
+            )
         partial_message = None
     except LineupGenerationPartial as exc:
         lineups = exc.lineups

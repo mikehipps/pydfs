@@ -103,10 +103,17 @@ class ParallelLineupJobConfig:
 
 
 class LineupGenerationPartial(Exception):
-    def __init__(self, lineups: list[LineupResult], message: str):
+    def __init__(self, lineups: list[LineupResult], message: str, bias_summary: dict | None = None):
         super().__init__(message)
         self.lineups = lineups
         self.message = message
+        self.bias_summary = bias_summary or {}
+
+
+@dataclass
+class BuildOutput:
+    lineups: List[LineupResult]
+    bias_summary: dict | None = None
 
 
 def _configure_solver() -> None:
@@ -423,6 +430,28 @@ def _normalize_percentage(value: float | None) -> float | None:
     return value if value <= 1.0 else value / 100.0
 
 
+def _summarize_bias(
+    bias_map: Mapping[str, float],
+    *,
+    bias_target: float,
+    bias_strength: float,
+    lineups_tracked: int,
+) -> dict | None:
+    if not bias_map:
+        return None
+    factors = list(bias_map.values())
+    if not factors:
+        return None
+    return {
+        "min_factor": min(factors),
+        "max_factor": max(factors),
+        "target_percent": bias_target,
+        "strength_percent": bias_strength * 100.0,
+        "lineups_tracked": lineups_tracked,
+        "factors": dict(bias_map),
+    }
+
+
 def generate_lineups_parallel(
     *,
     records: Sequence[PlayerRecord],
@@ -442,7 +471,7 @@ def generate_lineups_parallel(
     min_salary: Optional[int] = None,
     exposure_bias: float | None = None,
     exposure_bias_target: float | None = None,
-) -> List[LineupResult]:
+    ) -> BuildOutput:
     """Generate lineups across multiple processes with slight projection perturbations."""
 
     total_lineups = max(0, total_lineups)
@@ -572,6 +601,8 @@ def generate_lineups_parallel(
                     usage_counts[player.player_id] += 1
         return appended, new_unique, time.perf_counter() - batch_start
 
+    bias_summary: dict | None = None
+
     if workers == 1:
         next_job_id = 0
         partial_message: str | None = None
@@ -622,18 +653,22 @@ def generate_lineups_parallel(
                 )
                 partial_message = "No additional feasible lineups"
                 break
+        bias_summary = _summarize_bias(
+            last_bias_snapshot,
+            bias_target=bias_target,
+            bias_strength=bias_strength,
+            lineups_tracked=len(results),
+        ) if bias_strength > 0.0 else None
         if len(results) < total_lineups:
-            raise LineupGenerationPartial(results, partial_message or "Unable to build lineup")
-        if bias_strength > 0.0 and last_bias_snapshot:
-            bias_min = min(last_bias_snapshot.values())
-            bias_max = max(last_bias_snapshot.values())
+            raise LineupGenerationPartial(results, partial_message or "Unable to build lineup", bias_summary)
+        if bias_summary:
             logger.info(
                 "Final bias factors range %.3f – %.3f (target %.2f)",
-                bias_min,
-                bias_max,
-                bias_target,
+                bias_summary["min_factor"],
+                bias_summary["max_factor"],
+                bias_summary["target_percent"],
             )
-        return results[:total_lineups]
+        return BuildOutput(results[:total_lineups], bias_summary)
 
     ctx = mp.get_context('spawn')
     queue: mp.Queue = ctx.Queue()
@@ -724,18 +759,22 @@ def generate_lineups_parallel(
             if proc.is_alive():
                 proc.terminate()
 
+    bias_summary = _summarize_bias(
+        last_bias_snapshot,
+        bias_target=bias_target,
+        bias_strength=bias_strength,
+        lineups_tracked=len(results),
+    ) if bias_strength > 0.0 else None
     if partial_error or remaining_lineups() > 0:
-        raise LineupGenerationPartial(results, partial_error or "Unable to build lineup")
-    if bias_strength > 0.0 and last_bias_snapshot:
-        bias_min = min(last_bias_snapshot.values())
-        bias_max = max(last_bias_snapshot.values())
+        raise LineupGenerationPartial(results, partial_error or "Unable to build lineup", bias_summary)
+    if bias_summary:
         logger.info(
             "Final bias factors range %.3f – %.3f (target %.2f)",
-            bias_min,
-            bias_max,
-            bias_target,
+            bias_summary["min_factor"],
+            bias_summary["max_factor"],
+            bias_summary["target_percent"],
         )
-    return results[:total_lineups]
+    return BuildOutput(results[:total_lineups], bias_summary)
 
 
 def _lineup_to_result(lineup: Lineup, idx: int, baseline_lookup: Mapping[str, float]) -> LineupResult:
@@ -870,7 +909,7 @@ def build_lineups(
     min_salary: Optional[int] = None,
     exposure_bias: float | None = None,
     exposure_bias_target: float | None = None,
-) -> List[LineupResult]:
+) -> BuildOutput:
     """Generate lineups, optionally distributing work across processes."""
 
     workers = max(1, parallel_jobs)
@@ -897,7 +936,7 @@ def build_lineups(
 
     try:
         if not use_parallel:
-            return _build_lineups_serial(
+            lineups = _build_lineups_serial(
                 records,
                 site=site,
                 sport=sport,
@@ -909,6 +948,7 @@ def build_lineups(
                 max_exposure=max_exposure,
                 min_salary=min_salary,
             )
+            return BuildOutput(lineups, None)
 
         return generate_lineups_parallel(
             records=records,

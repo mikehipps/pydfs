@@ -13,3 +13,4 @@ class LineupBatchResponse(BaseModel):
     player_usage: list[PlayerUsageResponse]
     message: str | None = None
     slate_id: str | None = None
+    bias_summary: dict | None = None

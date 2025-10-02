@@ -106,6 +106,8 @@ def main() -> None:
             print(f"Note: {payload['message']}")
         if payload.get("slate_id"):
             print(f"Slate ID: {payload['slate_id']}")
+        if payload.get("bias_summary"):
+            print("Bias summary:", json.dumps(payload["bias_summary"], indent=2))
         print(json.dumps(payload["lineups"][0], indent=2))
 
 

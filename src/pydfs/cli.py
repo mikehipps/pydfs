@@ -102,6 +102,18 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum perturbation at the 75th percentile projection (fraction 0-1 or percent 0-100)",
     )
+    parser.add_argument(
+        "--exposure-bias",
+        type=float,
+        default=None,
+        help="Maximum exposure bias adjustment (fraction 0-1 or percent 0-100)",
+    )
+    parser.add_argument(
+        "--exposure-bias-target",
+        type=float,
+        default=None,
+        help="Target exposure percentage before bias kicks in (fraction 0-1 or percent 0-100)",
+    )
     return parser.parse_args()
 
 
@@ -194,6 +206,8 @@ def main() -> None:
             lineups_per_job=lineups_per_job,
             max_exposure=max_exposure,
             min_salary=args.min_salary,
+            exposure_bias=args.exposure_bias,
+            exposure_bias_target=args.exposure_bias_target,
         )
         partial_message = None
     except LineupGenerationPartial as exc:

@@ -123,6 +123,8 @@ async def test_lineups_endpoint(client: AsyncClient):
     assert detail["job"] is not None
     assert detail["request"]["perturbation_p25"] == pytest.approx(0.0)
     assert detail["request"]["perturbation_p75"] == pytest.approx(0.0)
+    assert detail["request"]["exposure_bias"] == pytest.approx(0.0)
+    assert detail["request"]["exposure_bias_target"] == pytest.approx(50.0)
     assert detail["request"].get("slate_id")
     assert detail["request"].get("slate_projections_filename")
 
@@ -177,6 +179,8 @@ async def test_lineups_with_custom_perturbation_ranges(client: AsyncClient):
         "lineups": 1,
         "perturbation_p25": 40,
         "perturbation_p75": 10,
+        "exposure_bias": 15,
+        "exposure_bias_target": 35,
     }
     data = {
         "lineup_request": json.dumps(request_payload),
@@ -192,6 +196,8 @@ async def test_lineups_with_custom_perturbation_ranges(client: AsyncClient):
     assert detail["request"]["perturbation_p25"] == pytest.approx(40.0)
     assert detail["request"]["perturbation_p75"] == pytest.approx(10.0)
     assert detail["request"].get("slate_id")
+    assert detail["request"]["exposure_bias"] == pytest.approx(15.0)
+    assert detail["request"]["exposure_bias_target"] == pytest.approx(35.0)
 
 
 @pytest.mark.anyio
@@ -239,6 +245,10 @@ async def test_lineup_pool_page(client: AsyncClient):
     assert "name=\"slate_id\"" in resp.text
     assert "Range: Today" in resp.text
     assert "Replace projections CSV" in resp.text
+    store = client.app.state.run_store
+    latest_slate = store.get_latest_slate()
+    assert latest_slate is not None
+    assert f"value=\"{latest_slate.slate_id}\" selected" in resp.text
 
     resp_filtered = await client.get("/ui/pool", params={"site": "FD", "sport": "NFL", "limit": 10})
     assert resp_filtered.status_code == 200
@@ -247,6 +257,12 @@ async def test_lineup_pool_page(client: AsyncClient):
     resp_shortcut = await client.get("/ui/pool/nfl/fd")
     assert resp_shortcut.status_code == 200
     assert "Lineup Pool" in resp_shortcut.text
+    assert f"value=\"{latest_slate.slate_id}\"" in resp_shortcut.text
+
+    resp_sport_only = await client.get("/ui/pool/nfl")
+    assert resp_sport_only.status_code == 200
+    assert "Lineup Pool" in resp_sport_only.text
+    assert "Current Slate" in resp_sport_only.text
 
 
 @pytest.mark.anyio

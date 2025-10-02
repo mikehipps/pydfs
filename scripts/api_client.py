@@ -34,6 +34,8 @@ def main() -> None:
     parser.add_argument("--perturbation", type=float, default=None, help="Legacy perturbation value (fraction or percent)")
     parser.add_argument("--perturbation-p25", dest="perturbation_p25", type=float, default=None, help="Perturbation cap at 25th percentile (fraction or percent)")
     parser.add_argument("--perturbation-p75", dest="perturbation_p75", type=float, default=None, help="Perturbation cap at 75th percentile (fraction or percent)")
+    parser.add_argument("--exposure-bias", dest="exposure_bias", type=float, default=None, help="Exposure bias strength (fraction or percent)")
+    parser.add_argument("--exposure-bias-target", dest="exposure_bias_target", type=float, default=None, help="Exposure bias target exposure (fraction or percent)")
     args = parser.parse_args()
 
     if args.list_runs or args.get_run or args.export_run:
@@ -90,6 +92,10 @@ def main() -> None:
             lineup_request["perturbation_p25"] = args.perturbation_p25
         if args.perturbation_p75 is not None:
             lineup_request["perturbation_p75"] = args.perturbation_p75
+        if args.exposure_bias is not None:
+            lineup_request["exposure_bias"] = args.exposure_bias
+        if args.exposure_bias_target is not None:
+            lineup_request["exposure_bias_target"] = args.exposure_bias_target
         data["lineup_request"] = json.dumps(lineup_request)
         resp = client.post("/lineups", files=make_files(), data=data)
         resp.raise_for_status()

@@ -4,7 +4,7 @@ import pytest
 
 from pydfs.models import PlayerRecord
 from pydfs.optimizer import build_lineups
-from pydfs.optimizer.service import _perturb_projections, _perturbation_window
+from pydfs.optimizer.service import _perturb_projections, _perturbation_window, _apply_bias_to_records
 
 
 def _sample_pool() -> list[PlayerRecord]:
@@ -108,3 +108,16 @@ def test_perturb_projections_respects_percentiles():
         expected_offset = max(-0.99, min(0.99, expected_offset))
         actual_offset = (updated.projection / original.projection) - 1.0
         assert pytest.approx(actual_offset, rel=1e-9) == expected_offset
+
+
+def test_apply_bias_to_records_adjusts_projection():
+    records = [
+        PlayerRecord(player_id="p1", name="One", team="A", positions=["UTIL"], salary=5000, projection=10.0),
+        PlayerRecord(player_id="p2", name="Two", team="A", positions=["UTIL"], salary=5200, projection=8.0),
+    ]
+    bias_map = {"p1": 1.2, "p2": 0.8}
+    biased = _apply_bias_to_records(records, bias_map)
+    assert biased[0].projection == pytest.approx(12.0)
+    assert biased[1].projection == pytest.approx(6.4)
+    assert biased[0].metadata["bias_factor"] == pytest.approx(1.2)
+    assert biased[1].metadata["bias_factor"] == pytest.approx(0.8)

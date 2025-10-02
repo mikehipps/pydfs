@@ -422,6 +422,14 @@ def _render_page(body: str) -> str:
 </html>"""
 
 
+def _coerce_percentage_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if value < 0:
+        return 0.0
+    return value * 100.0 if value <= 1.0 else value
+
+
 def _render_index_page(
     runs: list[RunRecord],
     preview,
@@ -434,6 +442,8 @@ def _render_index_page(
     parallel_jobs: int,
     perturbation_p25_value: float,
     perturbation_p75_value: float,
+    exposure_bias_value: float,
+    exposure_bias_target_value: float,
     max_exposure_value: float,
     lineups_per_job_value: int | None,
     max_repeating_players_value: int | None,
@@ -552,6 +562,12 @@ def _render_index_page(
 
         <label>Perturbation at 75th percentile (%)</label>
         <input type=\"number\" name=\"perturbation_p75\" min=\"0\" max=\"100\" step=\"1\" value=\"{perturbation_p75_value:.1f}\">
+
+        <label>Exposure bias (%)</label>
+        <input type=\"number\" name=\"exposure_bias\" min=\"0\" max=\"100\" step=\"1\" value=\"{exposure_bias_value:.1f}\">
+
+        <label>Bias target exposure (%)</label>
+        <input type=\"number\" name=\"exposure_bias_target\" min=\"0\" max=\"100\" step=\"1\" value=\"{exposure_bias_target_value:.1f}\">
 
         <label>Max player exposure (0-1)</label>
         <input type=\"number\" name=\"max_exposure\" min=\"0\" max=\"1\" step=\"0.05\" value=\"{max_exposure_value:.2f}\">
@@ -1451,6 +1467,8 @@ def create_app() -> FastAPI:
         perturbation: float = Form(0.0),
         perturbation_p25_form: float | None = Form(None, alias="perturbation_p25"),
         perturbation_p75_form: float | None = Form(None, alias="perturbation_p75"),
+        exposure_bias_form: float | None = Form(None, alias="exposure_bias"),
+        exposure_bias_target_form: float | None = Form(None, alias="exposure_bias_target"),
         max_exposure: float = Form(0.5),
         lineups_per_job: int | None = Form(None),
         max_repeating_players_form: int | None = Form(None),
@@ -1493,6 +1511,12 @@ def create_app() -> FastAPI:
             perturbation_p75 = max(0.0, p75_source * 100.0 if p75_source <= 1.0 else p75_source)
         if request.max_exposure is not None:
             max_exposure = request.max_exposure
+        exposure_bias_input = request.exposure_bias if request.exposure_bias is not None else exposure_bias_form
+        exposure_bias = _coerce_percentage_value(exposure_bias_input)
+        if exposure_bias is None:
+            exposure_bias = 0.0
+        exposure_bias_target_input = request.exposure_bias_target if request.exposure_bias_target is not None else exposure_bias_target_form
+        exposure_bias_target = _coerce_percentage_value(exposure_bias_target_input)
         site = raw_request.get("site") or site_form
         sport = raw_request.get("sport") or sport_form
         min_salary = raw_request.get("min_salary") if raw_request.get("min_salary") is not None else min_salary_form
@@ -1528,6 +1552,8 @@ def create_app() -> FastAPI:
             lineups_per_job = max(1, min(1000, lineups_per_job))
         if max_repeating_players is not None:
             max_repeating_players = max(0, max_repeating_players)
+        if exposure_bias_target is None and max_exposure is not None:
+            exposure_bias_target = max_exposure * 100.0
 
         records: list[PlayerRecord] = slate_inputs["records"]
         mapping_report: MappingPreviewResponse = slate_inputs["report"]
@@ -1565,6 +1591,8 @@ def create_app() -> FastAPI:
                 lineups_per_job=lineups_per_job,
                 max_exposure=max_exposure,
                 min_salary=min_salary,
+                exposure_bias=exposure_bias,
+                exposure_bias_target=exposure_bias_target,
             )
         except ValueError as exc:
             store.update_job_state(run_id, state="failed", message=str(exc))
@@ -1660,6 +1688,8 @@ def create_app() -> FastAPI:
                 "min_salary": min_salary,
                 "perturbation_p25": perturbation_p25,
                 "perturbation_p75": perturbation_p75,
+                "exposure_bias": exposure_bias,
+                "exposure_bias_target": exposure_bias_target,
                 "slate_id": slate_used.slate_id if slate_used else slate_id,
                 "slate_name": slate_used.name if slate_used else (slate_name or None),
                 "slate_players_filename": slate_used.players_filename if slate_used else (players.filename if players else None),
@@ -1805,6 +1835,8 @@ def create_app() -> FastAPI:
             parallel_jobs=1,
             perturbation_p25_value=40.0,
             perturbation_p75_value=10.0,
+            exposure_bias_value=0.0,
+            exposure_bias_target_value=50.0,
             max_exposure_value=0.5,
             lineups_per_job_value=None,
             max_repeating_players_value=None,
@@ -1832,18 +1864,45 @@ def create_app() -> FastAPI:
         if slate_filter:
             fetch_limit = max(fetch_limit, limit * 5)
         runs = store.list_runs(limit=fetch_limit)
-        slates = store.list_slates(limit=50)
-        selected_slate = store.get_slate(slate_filter) if slate_filter else None
-        if selected_slate is None and not slate_filter and not site_filter and not sport_filter and slates:
-            selected_slate = slates[0]
+
+        selected_slate: SlateRecord | None = store.get_slate(slate_filter) if slate_filter else None
+        if selected_slate is None and site_filter and sport_filter:
+            selected_slate = store.get_latest_slate(site=site_filter, sport=sport_filter)
+        if selected_slate is None and sport_filter:
+            selected_slate = store.get_latest_slate(sport=sport_filter)
+        if selected_slate is None and site_filter:
+            selected_slate = store.get_latest_slate(site=site_filter)
+
+        base_slates = store.list_slates(limit=50)
+        if selected_slate is None and base_slates:
+            selected_slate = base_slates[0]
+        if selected_slate is not None:
             slate_filter = selected_slate.slate_id
-        if selected_slate and all(slate.slate_id != selected_slate.slate_id for slate in slates):
-            slates = [selected_slate] + slates
+
+        seen_slates: set[str] = set()
+        ordered_slates: list[SlateRecord] = []
+
+        def _extend(collection: Iterable[SlateRecord]) -> None:
+            for slate in collection:
+                if slate.slate_id in seen_slates:
+                    continue
+                seen_slates.add(slate.slate_id)
+                ordered_slates.append(slate)
+
+        if selected_slate is not None:
+            _extend([selected_slate])
+        if sport_filter:
+            _extend(store.list_slates(sport=sport_filter, limit=50))
+        if site_filter and sport_filter:
+            _extend(store.list_slates(site=site_filter, sport=sport_filter, limit=50))
+        elif site_filter:
+            _extend(store.list_slates(site=site_filter, limit=50))
+        _extend(base_slates)
 
         today = datetime.now(timezone.utc).astimezone().date()
         return _render_lineup_pool_page(
             runs,
-            slates=slates,
+            slates=ordered_slates,
             selected_slate=selected_slate,
             slate_filter=slate_filter,
             site_filter=site_filter,
@@ -1998,6 +2057,26 @@ def create_app() -> FastAPI:
         )
         return HTMLResponse(content)
 
+    @app.get("/ui/pool/{sport}", response_class=HTMLResponse)
+    async def ui_pool_sport_only(
+        request: Request,
+        sport: str,
+        limit: int = 50,
+        all_dates: bool = Query(False),
+    ):
+        notice_msg = request.query_params.get("notice")
+        error_msg = request.query_params.get("error")
+        content = _render_pool_page(
+            site_filter=None,
+            sport_filter=sport.upper(),
+            slate_filter=request.query_params.get("slate_id"),
+            limit=limit,
+            all_dates=all_dates,
+            notice=notice_msg,
+            error=error_msg,
+        )
+        return HTMLResponse(content)
+
     @app.get("/ui/pool/{sport}/{site}", response_class=HTMLResponse)
     async def ui_pool_shortcut(
         request: Request,
@@ -2033,6 +2112,8 @@ def create_app() -> FastAPI:
         perturbation: float = Form(0.0),
         perturbation_p25_form: float | None = Form(None, alias="perturbation_p25"),
         perturbation_p75_form: float | None = Form(None, alias="perturbation_p75"),
+        exposure_bias_form: float | None = Form(None, alias="exposure_bias"),
+        exposure_bias_target_form: float | None = Form(None, alias="exposure_bias_target"),
         max_exposure: float = Form(0.5),
         lineups_per_job: int | None = Form(None),
         site: str = Form("FD"),
@@ -2044,24 +2125,24 @@ def create_app() -> FastAPI:
         parsed_players_mapping = _parse_mapping(players_mapping) or DEFAULT_PLAYERS_MAPPING.copy()
         parsed_projection_mapping = _parse_mapping(projection_mapping) or DEFAULT_PROJECTION_MAPPING.copy()
 
-        def _normalize_percentage(value: float | None) -> float | None:
-            if value is None:
-                return None
-            return value * 100.0 if value <= 1.0 else value
-
-        base_pct_value = _normalize_percentage(perturbation)
-        p25_normalized = _normalize_percentage(perturbation_p25_form)
+        base_pct_value = _coerce_percentage_value(perturbation)
+        p25_normalized = _coerce_percentage_value(perturbation_p25_form)
         if p25_normalized is None:
             perturbation_p25 = max(0.0, base_pct_value or 0.0)
         else:
             perturbation_p25 = max(0.0, p25_normalized)
 
-        p75_normalized = _normalize_percentage(perturbation_p75_form)
+        p75_normalized = _coerce_percentage_value(perturbation_p75_form)
         if p75_normalized is None:
             fallback = perturbation_p25 if perturbation_p25 > 0.0 else (base_pct_value or 0.0)
             perturbation_p75 = max(0.0, fallback)
         else:
             perturbation_p75 = max(0.0, p75_normalized)
+
+        exposure_bias = _coerce_percentage_value(exposure_bias_form)
+        if exposure_bias is None:
+            exposure_bias = 0.0
+        exposure_bias_target = _coerce_percentage_value(exposure_bias_target_form)
 
         parallel_jobs = max(1, parallel_jobs)
         max_exposure = max(0.0, min(1.0, max_exposure))
@@ -2069,6 +2150,8 @@ def create_app() -> FastAPI:
             lineups_per_job = max(1, min(1000, lineups_per_job))
         if max_repeating_players is not None:
             max_repeating_players = max(0, max_repeating_players)
+        if exposure_bias_target is None and max_exposure is not None:
+            exposure_bias_target = max_exposure * 100.0
 
         proj_path, projections_bytes = await _write_temp(projections)
         players_path, players_bytes = await _write_temp(players)
@@ -2133,6 +2216,8 @@ def create_app() -> FastAPI:
                         lineups_per_job=lineups_per_job,
                         max_exposure=max_exposure,
                         min_salary=min_salary,
+                        exposure_bias=exposure_bias,
+                        exposure_bias_target=exposure_bias_target,
                     )
                 except LineupGenerationPartial as exc:
                     partial_message = exc.message
@@ -2218,6 +2303,8 @@ def create_app() -> FastAPI:
                         "min_salary": min_salary,
                         "perturbation_p25": perturbation_p25,
                         "perturbation_p75": perturbation_p75,
+                        "exposure_bias": exposure_bias,
+                        "exposure_bias_target": exposure_bias_target,
                         "slate_id": slate_used.slate_id if slate_used else (slate_id.strip() if slate_id else None),
                         "slate_name": slate_used.name if slate_used else (slate_name or None),
                         "slate_players_filename": slate_used.players_filename if slate_used else (players.filename if players else None),
@@ -2269,6 +2356,8 @@ def create_app() -> FastAPI:
             parallel_jobs=parallel_jobs,
             perturbation_p25_value=perturbation_p25,
             perturbation_p75_value=perturbation_p75,
+            exposure_bias_value=exposure_bias,
+            exposure_bias_target_value=exposure_bias_target if exposure_bias_target is not None else (max_exposure * 100.0 if max_exposure is not None else 0.0),
             max_exposure_value=max_exposure,
             lineups_per_job_value=lineups_per_job,
             max_repeating_players_value=max_repeating_players,

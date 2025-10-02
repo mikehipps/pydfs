@@ -29,6 +29,8 @@ _PLAYER_MIN_PER_POS_ENV = "PYDFS_PLAYER_MIN_PER_POS"
 
 _PLAYER_RETAIN_DEFAULT = 0.75
 _PLAYER_MIN_PER_POS_DEFAULT = 8
+_EXPOSURE_BIAS_DEFAULT_TARGET = 0.4
+_EXPOSURE_BIAS_WARMUP_LINEUPS = 25
 
 
 def _env_float(name: str, default: float, *, clamp_min: float | None = None, clamp_max: float | None = None) -> float:
@@ -82,7 +84,7 @@ class ParallelLineupJobConfig:
                  site: str, sport: str, n_lineups: int, perturbation_p25: float, perturbation_p75: float,
                  max_repeating_players: Optional[int], max_from_one_team: Optional[int],
                  lock_player_ids: Optional[Iterable[str]], exclude_player_ids: Optional[Iterable[str]],
-                 max_exposure: Optional[float], min_salary: Optional[int]):
+                 max_exposure: Optional[float], min_salary: Optional[int], bias_factors: Optional[dict[str, float]] = None):
         self.job_id = job_id
         self.seed = seed
         self.records = records
@@ -97,6 +99,7 @@ class ParallelLineupJobConfig:
         self.exclude_player_ids = set(exclude_player_ids or []) or None
         self.max_exposure = max_exposure
         self.min_salary = min_salary
+        self.bias_factors = bias_factors or {}
 
 
 class LineupGenerationPartial(Exception):
@@ -306,6 +309,28 @@ def _filter_player_pool(
     return filtered
 
 
+def _apply_bias_to_records(
+    records: Sequence[PlayerRecord],
+    bias_factors: Mapping[str, float],
+) -> list[PlayerRecord]:
+    if not bias_factors:
+        return list(records)
+
+    biased_records: list[PlayerRecord] = []
+    for record in records:
+        bias = float(bias_factors.get(record.player_id, 1.0))
+        bias = max(0.0, bias)
+        new_projection = max(0.0, record.projection * bias)
+        metadata = dict(record.metadata)
+        metadata.setdefault("baseline_projection", float(metadata.get("baseline_projection", record.projection)))
+        metadata["bias_factor"] = bias
+        metadata["biased_projection"] = new_projection
+        biased_records.append(
+            record.model_copy(update={"projection": new_projection, "metadata": metadata})
+        )
+    return biased_records
+
+
 def _perturbation_window(percentile: float, pct25: float, pct75: float) -> float:
     """Return the max fractional perturbation for a given percentile."""
     if percentile <= 0.25:
@@ -390,6 +415,14 @@ def _parallel_worker(config: "ParallelLineupJobConfig", queue: mp.Queue) -> None
         queue.put(exc)
 
 
+def _normalize_percentage(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if value < 0:
+        return 0.0
+    return value if value <= 1.0 else value / 100.0
+
+
 def generate_lineups_parallel(
     *,
     records: Sequence[PlayerRecord],
@@ -407,6 +440,8 @@ def generate_lineups_parallel(
     perturbation_p75: float | None = None,
     max_exposure: Optional[float] = None,
     min_salary: Optional[int] = None,
+    exposure_bias: float | None = None,
+    exposure_bias_target: float | None = None,
 ) -> List[LineupResult]:
     """Generate lineups across multiple processes with slight projection perturbations."""
 
@@ -436,6 +471,18 @@ def generate_lineups_parallel(
     results: list[LineupResult] = []
     seen_signatures: set[tuple[str, ...]] = set()
     pool_size = len(records_list)
+    bias_strength = _normalize_percentage(exposure_bias) or 0.0
+    bias_strength = min(max(bias_strength, 0.0), 0.9)
+    bias_target_input = _normalize_percentage(exposure_bias_target)
+    if bias_target_input is not None:
+        bias_target = max(0.01, min(1.0, bias_target_input))
+    elif max_exposure is not None:
+        bias_target = max(0.01, min(1.0, max_exposure))
+    else:
+        bias_target = _EXPOSURE_BIAS_DEFAULT_TARGET
+    usage_counts: defaultdict[str, int] = defaultdict(int)
+    last_bias_snapshot: dict[str, float] = {}
+
     position_counts: dict[str, int] = defaultdict(int)
     for record in records_list:
         for pos in record.positions:
@@ -463,12 +510,37 @@ def generate_lineups_parallel(
     def remaining_lineups() -> int:
         return total_lineups - len(results)
 
-    def build_config(job_id: int, batch: int) -> ParallelLineupJobConfig:
+    def compute_bias_map() -> dict[str, float]:
+        if bias_strength <= 0.0:
+            return {}
+        total = len(results)
+        if total <= 0:
+            return {}
+        target = bias_target
+        if target <= 0:
+            return {}
+        clamp_min = max(0.0, 1.0 - bias_strength)
+        clamp_max = 1.0 + bias_strength
+        warmup_scale = min(1.0, total / _EXPOSURE_BIAS_WARMUP_LINEUPS)
+        bias_map: dict[str, float] = {}
+        for record in records_list:
+            exposure = usage_counts.get(record.player_id, 0) / total
+            delta = target - exposure
+            adjust_ratio = delta / target
+            factor = 1.0 + adjust_ratio * bias_strength * warmup_scale
+            if factor < clamp_min:
+                factor = clamp_min
+            elif factor > clamp_max:
+                factor = clamp_max
+            bias_map[record.player_id] = factor
+        return bias_map
+
+    def build_config(job_id: int, batch: int, records_for_job: Optional[Sequence[PlayerRecord]] = None, bias_map: Optional[dict[str, float]] = None) -> ParallelLineupJobConfig:
         seed = random.randint(1, 2 ** 31 - 1)
         return ParallelLineupJobConfig(
             job_id=job_id,
             seed=seed,
-            records=records_list,
+            records=list(records_for_job) if records_for_job is not None else list(records_list),
             site=site,
             sport=sport,
             n_lineups=batch,
@@ -480,6 +552,7 @@ def generate_lineups_parallel(
             exclude_player_ids=exclude_player_ids,
             max_exposure=max_exposure,
             min_salary=min_salary,
+            bias_factors=bias_map,
         )
 
     def apply_outcome(outcome: ParallelLineupJobResult, batch_start: float) -> tuple[int, int, float]:
@@ -494,6 +567,9 @@ def generate_lineups_parallel(
             if signature not in seen_signatures:
                 seen_signatures.add(signature)
                 new_unique += 1
+            if bias_strength > 0.0:
+                for player in lineup.players:
+                    usage_counts[player.player_id] += 1
         return appended, new_unique, time.perf_counter() - batch_start
 
     if workers == 1:
@@ -501,7 +577,12 @@ def generate_lineups_parallel(
         partial_message: str | None = None
         while remaining_lineups() > 0:
             batch = min(per_job, remaining_lineups())
-            config = build_config(next_job_id, batch)
+            bias_map = compute_bias_map() if bias_strength > 0.0 else {}
+            records_override = None
+            if bias_map:
+                records_override = _apply_bias_to_records(records_list, bias_map)
+                last_bias_snapshot = bias_map
+            config = build_config(next_job_id, batch, records_override, bias_map if bias_map else None)
             logger.info(
                 "Sequential batch %s – requesting %s lineups (seed=%s, total %.2fs, pool=%s, positions=%s)",
                 config.job_id,
@@ -543,6 +624,15 @@ def generate_lineups_parallel(
                 break
         if len(results) < total_lineups:
             raise LineupGenerationPartial(results, partial_message or "Unable to build lineup")
+        if bias_strength > 0.0 and last_bias_snapshot:
+            bias_min = min(last_bias_snapshot.values())
+            bias_max = max(last_bias_snapshot.values())
+            logger.info(
+                "Final bias factors range %.3f – %.3f (target %.2f)",
+                bias_min,
+                bias_max,
+                bias_target,
+            )
         return results[:total_lineups]
 
     ctx = mp.get_context('spawn')
@@ -552,12 +642,17 @@ def generate_lineups_parallel(
     next_job_id = 0
 
     def start_job(batch: int) -> None:
-        nonlocal next_job_id
+        nonlocal next_job_id, last_bias_snapshot
         if batch <= 0:
             return
         if remaining_lineups() <= 0:
             return
-        config = build_config(next_job_id, batch)
+        bias_map = compute_bias_map() if bias_strength > 0.0 else {}
+        records_override = None
+        if bias_map:
+            records_override = _apply_bias_to_records(records_list, bias_map)
+            last_bias_snapshot = bias_map
+        config = build_config(next_job_id, batch, records_override, bias_map if bias_map else None)
         logger.info(
             "Dispatching batch %s – requesting %s lineups (seed=%s, total %.2fs, pool=%s, positions=%s)",
             config.job_id,
@@ -631,6 +726,15 @@ def generate_lineups_parallel(
 
     if partial_error or remaining_lineups() > 0:
         raise LineupGenerationPartial(results, partial_error or "Unable to build lineup")
+    if bias_strength > 0.0 and last_bias_snapshot:
+        bias_min = min(last_bias_snapshot.values())
+        bias_max = max(last_bias_snapshot.values())
+        logger.info(
+            "Final bias factors range %.3f – %.3f (target %.2f)",
+            bias_min,
+            bias_max,
+            bias_target,
+        )
     return results[:total_lineups]
 
 
@@ -764,6 +868,8 @@ def build_lineups(
     lineups_per_job: int | None = None,
     max_exposure: Optional[float] = 0.5,
     min_salary: Optional[int] = None,
+    exposure_bias: float | None = None,
+    exposure_bias_target: float | None = None,
 ) -> List[LineupResult]:
     """Generate lineups, optionally distributing work across processes."""
 
@@ -779,11 +885,14 @@ def build_lineups(
     p75_value = perturbation_p75 if perturbation_p75 is not None else p25_value
     p75_value = p75_value * 100.0 if p75_value <= 1.0 else p75_value
 
+    bias_strength = _normalize_percentage(exposure_bias) or 0.0
+
     use_parallel = (
         workers > 1
         or (per_job is not None and per_job < n_lineups)
         or p25_value > 0.0
         or p75_value > 0.0
+        or bias_strength > 0.0
     )
 
     try:
@@ -816,6 +925,8 @@ def build_lineups(
             perturbation_p75=p75_value,
             max_exposure=max_exposure,
             min_salary=min_salary,
+            exposure_bias=exposure_bias,
+            exposure_bias_target=exposure_bias_target,
         )
     except LineupGenerationPartial as exc:
         exc.lineups = exc.lineups[:n_lineups]

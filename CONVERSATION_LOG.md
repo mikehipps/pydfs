@@ -6,6 +6,8 @@
 - Planned future enhancements around advanced filtering (median thresholds, player locks) once the combined pool view is in place.
 - Delivered percentile-based perturbation controls (P25/P75 knobs), updated UI/CLI/API wiring, and documented/validated the new randomness curve.
 - Lineup pool now centers on named slates, displays current projection metadata, and lets you refresh projections in place so the pool rescales without a fresh solve.
+- Pool routes now auto-select the freshest slate (global/sport/site-specific) so `/ui/pool`, `/ui/pool/{sport}`, and `/ui/pool/{sport}/{site}` always open on the latest relevant context while still allowing manual slate selection.
+- Added usage-aware randomness: successive optimizer jobs bias projections toward underused players (and away from overused ones) with configurable strength/targets; state is persisted with runs and surfaced through the API/CLI/UI inputs.
 - Delivered percentile-based perturbation controls (P25/P75 knobs), updated UI/CLI/API wiring, and documented/validated the new randomness curve.
 
 ## Recent Conversation Snapshot

@@ -9,7 +9,7 @@ import os
 import random
 import time
 from collections import defaultdict
-from typing import Iterable, List, Optional, Sequence, Tuple, Mapping
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, Mapping
 
 from pydfs_lineup_optimizer import Site, Sport, get_optimizer
 from pydfs_lineup_optimizer.lineup import Lineup
@@ -47,6 +47,19 @@ _SINGLE_GAME_ALLOWED_BASE_POSITIONS: dict[str, set[str]] = {
     "MLB": {"1B", "2B", "3B", "SS", "OF", "C", "C/1B"},
     "NHL": {"C", "W", "D"},
 }
+
+
+def _coerce_salary(value: float | int) -> int:
+    return int(round(float(value)))
+
+
+def _resolve_base_salary(metadata: Mapping[str, Any], salary: int, multiplier: float | None = None) -> int:
+    stored = metadata.get("base_salary")
+    if isinstance(stored, (int, float)):
+        return _coerce_salary(stored)
+    if multiplier and multiplier not in (0.0, 1.0):
+        return _coerce_salary(salary / multiplier)
+    return salary
 
 
 def _apply_roster_rules_to_optimizer(optimizer, site: str, sport: str) -> None:
@@ -410,17 +423,35 @@ def _expand_single_game_records(
         base_positions = [pos for pos in base_positions if pos]
         if existing_positions and existing_positions.issubset(set(role_map.keys())):
             role = next(iter(existing_positions))
+            multiplier = role_map.get(role, 1.0)
+            base_salary = _resolve_base_salary(base_metadata, record.salary, multiplier)
+            base_baseline = float(
+                base_metadata.get(
+                    "baseline_projection",
+                    record.projection / multiplier if multiplier else record.projection,
+                )
+            )
             role_metadata = dict(base_metadata)
             role_metadata.setdefault("single_game_role", role)
-            role_metadata.setdefault(
-                "single_game_multiplier",
-                role_map.get(role, 1.0),
+            role_metadata.setdefault("single_game_multiplier", multiplier)
+            role_metadata.setdefault("base_salary", base_salary)
+            role_metadata["baseline_projection"] = base_baseline
+            expanded.append(
+                record.model_copy(
+                    update={
+                        "salary": _coerce_salary(base_salary * multiplier),
+                        "metadata": role_metadata,
+                    }
+                )
             )
-            expanded.append(record.model_copy(update={"metadata": role_metadata}))
             continue
 
         base_metadata.setdefault("single_game_role", "BASE")
         base_metadata.setdefault("single_game_multiplier", 1.0)
+        base_salary = _resolve_base_salary(base_metadata, record.salary)
+        base_metadata["base_salary"] = base_salary
+        base_baseline = float(base_metadata.get("baseline_projection", record.projection))
+        base_metadata["baseline_projection"] = base_baseline
         if not base_positions and metadata_positions:
             base_positions = list(metadata_positions)
         if allowed_positions and base_positions:
@@ -438,6 +469,7 @@ def _expand_single_game_records(
             record.model_copy(
                 update={
                     "positions": base_record_positions,
+                    "salary": base_salary,
                     "metadata": base_metadata,
                 }
             )
@@ -454,12 +486,14 @@ def _expand_single_game_records(
             role_metadata["single_game_multiplier"] = multiplier
             baseline = float(role_metadata.get("baseline_projection", record.projection))
             role_metadata["baseline_projection"] = baseline * multiplier
+            role_metadata["base_salary"] = base_salary
             variant_id = f"{record.player_id}__{role}"
             expanded.append(
                 record.model_copy(
                     update={
                         "player_id": variant_id,
                         "positions": [role],
+                        "salary": _coerce_salary(base_salary * multiplier),
                         "projection": record.projection * multiplier,
                         "metadata": role_metadata,
                     }

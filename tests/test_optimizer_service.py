@@ -146,9 +146,14 @@ def test_expand_single_game_records_creates_variants():
     ids = {record.player_id for record in expanded}
     assert base.player_id in ids
     assert f"{base.player_id}__MVP" in ids
+    base_variant = next(record for record in expanded if record.player_id == base.player_id)
+    assert base_variant.salary == 9000
+    assert base_variant.metadata["base_salary"] == 9000
     mvp = next(record for record in expanded if record.player_id.endswith("__MVP"))
     assert mvp.projection == pytest.approx(30.0)
     assert mvp.positions == ["MVP"]
+    assert mvp.salary == 13_500
+    assert mvp.metadata["base_salary"] == 9000
     assert mvp.metadata["single_game_role"] == "MVP"
 
 
@@ -167,8 +172,11 @@ def test_expand_single_game_records_uses_base_positions_metadata():
     base_variant = next(record for record in expanded if record.player_id == "wr1")
     assert base_variant.positions == ["WR"]
     assert base_variant.metadata["base_positions"] == ("WR",)
+    assert base_variant.salary == 11_000
+    assert base_variant.metadata["base_salary"] == 11_000
     mvp_variant = next(record for record in expanded if record.player_id.endswith("__MVP"))
     assert mvp_variant.metadata["base_positions"] == ("WR",)
+    assert mvp_variant.salary == 16_500
 
 
 def test_build_lineups_single_game_generates_mvp_slot():

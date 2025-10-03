@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import csv
-from pathlib import Path
+import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
-from typing import Mapping, Optional
-
 from pydfs.config import get_rules
 from pydfs.models import PlayerRecord
 
+
+logger = logging.getLogger(__name__)
 
 NFL_TEAM_ALIAS_GROUPS: dict[str, list[str]] = {
     "ARI": ["ARI", "ARIZONA", "ARIZONA CARDINALS", "ARIZONA CARDS", "ARIZONA DST", "ARIZONA D/ST"],
@@ -199,6 +200,30 @@ def _parse_flag(value: Optional[str]) -> Optional[bool]:
     return None
 
 
+_SINGLE_GAME_ROLE_TOKENS = {"MVP", "STAR", "PRO", "CAPTAIN"}
+
+
+def infer_site_variant(site: str, sport: str, rows: Sequence["ProjectionRow"]) -> tuple[str, str]:
+    """Infer adjusted site/sport keys based on roster hints in the player rows."""
+
+    site_key = site.upper()
+    sport_key = sport.upper()
+    if site_key != "FD":
+        return site_key, sport_key
+
+    role_tokens: set[str] = set()
+    for row in rows:
+        raw = (row.raw_position or "").strip()
+        if not raw:
+            continue
+        parts = re.split(r"[/,\\s]+", raw)
+        role_tokens.update(part.upper() for part in parts if part)
+
+    if role_tokens & _SINGLE_GAME_ROLE_TOKENS:
+        return "FD_SINGLE", sport_key
+    return site_key, sport_key
+
+
 def _canonical_positions(site: str, sport: str, position: Optional[str]) -> List[str]:
     if not position:
         return []
@@ -221,22 +246,51 @@ def _canonical_positions(site: str, sport: str, position: Optional[str]) -> List
 
 
 def rows_to_records(
-    rows: Sequence[ProjectionRow], *, site: str, sport: str
+    rows: Sequence[ProjectionRow],
+    *,
+    site: str,
+    sport: str,
+    fallback_positions_by_id: Mapping[str, Sequence[str]] | None = None,
+    fallback_positions_by_key: Mapping[str, Sequence[str]] | None = None,
 ) -> List[PlayerRecord]:
     records: List[PlayerRecord] = []
+    fallback_positions_by_id = fallback_positions_by_id or {}
+    fallback_positions_by_key = fallback_positions_by_key or {}
     for row in rows:
         positions = _canonical_positions(site, sport, row.raw_position)
-        metadata = {}
+        if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
+            positions = ["D"]
+        team_abbrev = _canonical_team(row.raw_team, sport) if row.raw_team else ""
+        fallback_positions: Sequence[str] | None = None
+        if not positions and row.raw_id:
+            fallback_positions = fallback_positions_by_id.get(row.raw_id)
+        if not positions and not fallback_positions:
+            lookup_key = _record_key(row.raw_name, team_abbrev, is_defense=False)
+            fallback_positions = fallback_positions_by_key.get(lookup_key)
+        if not positions and not fallback_positions:
+            defense_key = _record_key(row.raw_name, team_abbrev, is_defense=True)
+            fallback_positions = fallback_positions_by_key.get(defense_key)
+        if not positions and fallback_positions:
+            positions = [pos for pos in fallback_positions if pos]
+        metadata: dict[str, object] = {}
         if row.ownership is not None:
             metadata["projected_ownership"] = row.ownership
         projection_value = _parse_projection(row.raw_projection)
         metadata.setdefault("baseline_projection", projection_value)
+        base_positions: Sequence[str] | None = None
+        if positions:
+            base_positions = positions
+        elif fallback_positions:
+            base_positions = fallback_positions
+        if base_positions:
+            metadata.setdefault("base_positions", tuple(base_positions))
+        if row.raw_position is not None:
+            metadata.setdefault("raw_position", row.raw_position)
         if row.raw_injury_status:
             metadata["injury_status"] = row.raw_injury_status.strip()
         flag = _parse_flag(row.raw_probable_pitcher)
         if flag is not None:
             metadata["probable_pitcher"] = flag
-        team_abbrev = _canonical_team(row.raw_team, sport) if row.raw_team else ""
         records.append(
             PlayerRecord(
                 player_id=row.raw_id or row.raw_name,
@@ -263,6 +317,20 @@ def load_records_from_csv(
 
 _NAME_SUFFIX_TOKENS = {"jr", "sr", "ii", "iii", "iv", "v"}
 _DEFENSE_TOKENS = {"dst", "defense", "def", "d"}
+_SINGLE_GAME_DEFENSE_PATTERN = re.compile(r"\b(?:D/?ST|DST|DEF(?:ENSE)?)\b", re.IGNORECASE)
+
+
+def _is_fanduel_single_game_defense(
+    row: ProjectionRow, *, site: str, sport: str
+) -> bool:
+    if site.upper() not in {"FD", "FD_SINGLE"} or sport.upper() != "NFL":
+        return False
+    position = row.raw_position or ""
+    if position.strip():
+        return False
+    if not row.raw_name:
+        return False
+    return bool(_SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name))
 
 
 def _normalize_name(name: str, *, is_defense: bool = False, team: str | None = None) -> str:
@@ -282,6 +350,44 @@ def _record_key(name: str, team: str, *, is_defense: bool = False) -> str:
     return f"{_normalize_name(name, is_defense=is_defense, team=team)}::{team}"
 
 
+def _load_single_game_position_lookup(
+    players_path: Path,
+    sport: str,
+) -> tuple[dict[str, Sequence[str]], dict[str, Sequence[str]]]:
+    """Build lookup tables of classic positions for FanDuel single-game slates."""
+
+    from pydfs_lineup_optimizer.exceptions import LineupOptimizerIncorrectCSV
+    from pydfs_lineup_optimizer.sites.fanduel.classic.importer import FanDuelCSVImporter
+
+    by_id: dict[str, Sequence[str]] = {}
+    by_key: dict[str, Sequence[str]] = {}
+
+    try:
+        importer = FanDuelCSVImporter(str(players_path))
+        players = importer.import_players()
+    except (FileNotFoundError, LineupOptimizerIncorrectCSV, ValueError) as exc:
+        logger.debug("Unable to load FanDuel positions from %s: %s", players_path, exc)
+        return by_id, by_key
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        logger.warning(
+            "Unexpected error loading FanDuel positions from %s: %s", players_path, exc
+        )
+        return by_id, by_key
+
+    for player in players:
+        positions = [pos.strip().upper() for pos in player.positions if pos.strip()]
+        if not positions:
+            continue
+        by_id[player.id] = positions
+        team_abbrev = _canonical_team(player.team, sport) if player.team else ""
+        base_key = _record_key(player.full_name, team_abbrev, is_defense=False)
+        by_key.setdefault(base_key, positions)
+        defense_key = _record_key(player.full_name, team_abbrev, is_defense=True)
+        by_key.setdefault(defense_key, positions)
+
+    return by_id, by_key
+
+
 def merge_player_and_projection_files(
     *,
     players_path: Path,
@@ -290,10 +396,34 @@ def merge_player_and_projection_files(
     sport: str,
     players_mapping: Optional[Mapping[str, str]] = None,
     projection_mapping: Optional[Mapping[str, str]] = None,
+    players_rows: Sequence[ProjectionRow] | None = None,
+    projection_rows: Sequence[ProjectionRow] | None = None,
 ) -> Tuple[List[PlayerRecord], MergeReport]:
-    players_rows = load_projection_csv(players_path, mapping=players_mapping or DEFAULT_PLAYERS_MAPPING)
+    if players_rows is None:
+        players_rows = load_projection_csv(players_path, mapping=players_mapping or DEFAULT_PLAYERS_MAPPING)
+
+    fallback_positions_by_id: dict[str, Sequence[str]] = {}
+    fallback_positions_by_key: dict[str, Sequence[str]] = {}
+    if site.upper() == "FD_SINGLE":
+        if players_path is not None:
+            fallback_positions_by_id, fallback_positions_by_key = _load_single_game_position_lookup(
+                players_path,
+                sport,
+            )
+        else:
+            logger.debug("Single-game fallback positions unavailable (players file missing)")
+
     base_records = {}
-    for row, record in zip(players_rows, rows_to_records(players_rows, site=site, sport=sport)):
+    for row, record in zip(
+        players_rows,
+        rows_to_records(
+            players_rows,
+            site=site,
+            sport=sport,
+            fallback_positions_by_id=fallback_positions_by_id,
+            fallback_positions_by_key=fallback_positions_by_key,
+        ),
+    ):
         key = _record_key(row.raw_name, record.team, is_defense="D" in record.positions)
         base_records[key] = record
 
@@ -309,11 +439,28 @@ def merge_player_and_projection_files(
         )
         return list(base_records.values()), report
 
-    overlay_rows = load_projection_csv(projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING)
+    overlay_rows = projection_rows or load_projection_csv(
+        projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING
+    )
     overlay_created_keys: set[str] = set()
     for row in overlay_rows:
         team_abbrev = _canonical_team(row.raw_team, sport)
         positions = _canonical_positions(site, sport, row.raw_position)
+        if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
+            positions = ["D"]
+        fallback_positions: Sequence[str] | None = None
+        if row.raw_id:
+            fallback_positions = fallback_positions_by_id.get(row.raw_id)
+        if not fallback_positions:
+            fallback_positions = fallback_positions_by_key.get(
+                _record_key(row.raw_name, team_abbrev, is_defense=False)
+            )
+        if not fallback_positions:
+            fallback_positions = fallback_positions_by_key.get(
+                _record_key(row.raw_name, team_abbrev, is_defense=True)
+            )
+        if not positions and fallback_positions:
+            positions = [pos for pos in fallback_positions if pos]
         is_defense = "D" in positions
         key = _record_key(row.raw_name, team_abbrev, is_defense=is_defense)
         if key not in base_records:
@@ -323,6 +470,10 @@ def merge_player_and_projection_files(
                 metadata["projected_ownership"] = row.ownership
             projection_value = _parse_projection(row.raw_projection)
             metadata.setdefault("baseline_projection", projection_value)
+            if positions:
+                metadata.setdefault("base_positions", tuple(positions))
+            elif fallback_positions:
+                metadata.setdefault("base_positions", tuple(fallback_positions))
             if row.raw_injury_status:
                 metadata["injury_status"] = row.raw_injury_status.strip()
             flag = _parse_flag(row.raw_probable_pitcher)
@@ -351,6 +502,13 @@ def merge_player_and_projection_files(
             metadata["projected_ownership"] = row.ownership
         projection_value = _parse_projection(row.raw_projection)
         metadata["baseline_projection"] = projection_value
+        if "base_positions" not in metadata:
+            if positions:
+                metadata["base_positions"] = tuple(positions)
+            elif fallback_positions:
+                metadata["base_positions"] = tuple(fallback_positions)
+        if row.raw_position is not None and "raw_position" not in metadata:
+            metadata["raw_position"] = row.raw_position
         flag = _parse_flag(row.raw_probable_pitcher)
         if flag is not None:
             metadata["probable_pitcher"] = flag
@@ -359,8 +517,13 @@ def merge_player_and_projection_files(
             "salary": _parse_salary(row.raw_salary, default=existing.salary),
             "metadata": metadata,
         }
-        if row.raw_position:
-            update["positions"] = positions or existing.positions
+        chosen_positions: Sequence[str] | None = None
+        if positions:
+            chosen_positions = positions
+        elif fallback_positions:
+            chosen_positions = fallback_positions
+        if chosen_positions:
+            update["positions"] = list(chosen_positions)
         if row.raw_id:
             update["player_id"] = row.raw_id
         if team_abbrev:

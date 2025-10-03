@@ -185,6 +185,7 @@ def test_build_lineups_single_game_generates_mvp_slot():
 
     assert len(output.lineups) == 1
     lineup = output.lineups[0]
-    assert len(lineup.players) == 5
+    assert len(lineup.players) == 6
     assert any("MVP" in player.positions for player in lineup.players)
-    assert any(player.player_id.endswith("__MVP") for player in lineup.players)
+    mvp_count = sum(1 for player in lineup.players if player.player_id.endswith("__MVP"))
+    assert mvp_count == 1

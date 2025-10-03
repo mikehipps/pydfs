@@ -55,7 +55,7 @@ _ROSTER_RULES: Dict[Tuple[str, str], RosterRules] = {
         site="FD_SINGLE",
         sport="NFL",
         salary_cap=60_000,
-        roster_order=("MVP", "UTIL", "UTIL", "UTIL", "UTIL"),
+        roster_order=("MVP", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL"),
         slot_positions={
             "MVP": {"MVP"},
             "UTIL": {"QB", "RB", "WR", "TE", "K"},

@@ -13,8 +13,10 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Mapping
 
 from pydfs_lineup_optimizer import Site, Sport, get_optimizer
 from pydfs_lineup_optimizer.lineup import Lineup
+from pydfs_lineup_optimizer.player_pool import LineupPosition, PlayerPool
 from pydfs_lineup_optimizer.exceptions import LineupOptimizerException
 
+from pydfs.config.roster import get_rules
 from pydfs.models import PlayerRecord
 
 
@@ -45,6 +47,54 @@ _SINGLE_GAME_ALLOWED_BASE_POSITIONS: dict[str, set[str]] = {
     "MLB": {"1B", "2B", "3B", "SS", "OF", "C", "C/1B"},
     "NHL": {"C", "W", "D"},
 }
+
+
+def _apply_roster_rules_to_optimizer(optimizer, site: str, sport: str) -> None:
+    try:
+        rules = get_rules(site, sport)
+    except KeyError:
+        return
+
+    settings = optimizer.settings
+    current_order = tuple(position.name for position in getattr(settings, "positions", ()))
+    desired_order = tuple(rules.roster_order)
+    current_team_max = getattr(settings, "max_from_one_team", None)
+    changed_positions = current_order != desired_order
+    changed_team_max = current_team_max != rules.team_max_players
+
+    if not changed_positions and not changed_team_max:
+        return
+
+    if changed_positions:
+        slot_positions = rules.slot_positions
+        new_positions: list[LineupPosition] = []
+        for slot in desired_order:
+            allowed = slot_positions.get(slot)
+            if not allowed:
+                fallback = next(
+                    (tuple(pos.positions) for pos in settings.positions if pos.name == slot),
+                    (),
+                )
+                if fallback:
+                    allowed = set(fallback)
+            if not allowed:
+                logger.warning(
+                    "No eligible positions configured for slot %s when applying roster override for %s %s; skipping override",
+                    slot,
+                    site,
+                    sport,
+                )
+                return
+            new_positions.append(LineupPosition(slot, tuple(sorted(allowed))))
+        settings_cls = settings.__class__
+        settings_cls.positions = list(new_positions)
+        settings.positions = list(new_positions)
+        optimizer.player_pool = PlayerPool(settings)
+
+    if changed_team_max:
+        settings_cls = settings.__class__
+        settings_cls.max_from_one_team = rules.team_max_players
+        settings.max_from_one_team = rules.team_max_players
 
 
 def _env_float(name: str, default: float, *, clamp_min: float | None = None, clamp_max: float | None = None) -> float:
@@ -922,6 +972,7 @@ def _build_lineups_serial(
 
     active_records = _filter_player_pool(list(records), mandatory_ids=lock_player_ids)
     optimizer = get_optimizer(_resolve_site(site), _resolve_sport(sport))
+    _apply_roster_rules_to_optimizer(optimizer, site, sport)
     if min_salary is not None:
         if hasattr(optimizer, "set_min_salary_cap"):
             optimizer.set_min_salary_cap(min_salary)

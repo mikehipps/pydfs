@@ -32,6 +32,20 @@ _PLAYER_MIN_PER_POS_DEFAULT = 8
 _EXPOSURE_BIAS_DEFAULT_TARGET = 0.4
 _EXPOSURE_BIAS_WARMUP_LINEUPS = 25
 
+_SINGLE_GAME_MULTIPLIERS: dict[str, dict[str, float]] = {
+    "NFL": {"MVP": 1.5},
+    "NBA": {"MVP": 2.0, "STAR": 1.5, "PRO": 1.2},
+    "MLB": {"MVP": 2.0, "STAR": 1.5},
+    "NHL": {"CAPTAIN": 1.5},
+}
+
+_SINGLE_GAME_ALLOWED_BASE_POSITIONS: dict[str, set[str]] = {
+    "NFL": {"QB", "RB", "WR", "TE", "K"},
+    "NBA": {"PG", "SG", "SF", "PF", "C"},
+    "MLB": {"1B", "2B", "3B", "SS", "OF", "C", "C/1B"},
+    "NHL": {"C", "W", "D"},
+}
+
 
 def _env_float(name: str, default: float, *, clamp_min: float | None = None, clamp_max: float | None = None) -> float:
     raw = os.getenv(name)
@@ -254,6 +268,11 @@ def _to_pydfs_players(records: Sequence[PlayerRecord]):
     dfs_players: List[PydfsPlayer] = []
     for record in records:
         first, last = _split_name(record.name)
+        base_positions = record.metadata.get("base_positions")
+        if base_positions:
+            base_positions_list = list(base_positions)
+        else:
+            base_positions_list = list(record.positions) if record.positions else None
         dfs_players.append(
             PydfsPlayer(
                 player_id=record.player_id,
@@ -266,6 +285,7 @@ def _to_pydfs_players(records: Sequence[PlayerRecord]):
                 projected_ownership=record.metadata.get("projected_ownership"),
                 fppg_floor=record.metadata.get("projection_floor"),
                 fppg_ceil=record.metadata.get("projection_ceil"),
+                original_positions=base_positions_list,
             )
         )
     return dfs_players
@@ -314,6 +334,88 @@ def _filter_player_pool(
     else:
         logger.info("Player pool retained full size (%s players)", len(records))
     return filtered
+
+
+def _expand_single_game_records(
+    records: Sequence[PlayerRecord], *, site: str, sport: str
+) -> list[PlayerRecord]:
+    if site.upper() != "FD_SINGLE":
+        return [record.model_copy() for record in records]
+
+    sport_key = sport.upper()
+    role_map = _SINGLE_GAME_MULTIPLIERS.get(sport_key)
+    if not role_map:
+        return [record.model_copy() for record in records]
+
+    allowed_positions = _SINGLE_GAME_ALLOWED_BASE_POSITIONS.get(sport_key)
+    expanded: list[PlayerRecord] = []
+    for record in records:
+        base_metadata = dict(record.metadata)
+        base_metadata.setdefault("base_player_id", record.player_id)
+        existing_positions = set(record.positions)
+        metadata_positions = base_metadata.get("base_positions")
+        base_positions = list(record.positions)
+        if metadata_positions and not base_positions:
+            base_positions = list(metadata_positions)
+        base_positions = [pos for pos in base_positions if pos]
+        if existing_positions and existing_positions.issubset(set(role_map.keys())):
+            role = next(iter(existing_positions))
+            role_metadata = dict(base_metadata)
+            role_metadata.setdefault("single_game_role", role)
+            role_metadata.setdefault(
+                "single_game_multiplier",
+                role_map.get(role, 1.0),
+            )
+            expanded.append(record.model_copy(update={"metadata": role_metadata}))
+            continue
+
+        base_metadata.setdefault("single_game_role", "BASE")
+        base_metadata.setdefault("single_game_multiplier", 1.0)
+        if not base_positions and metadata_positions:
+            base_positions = list(metadata_positions)
+        if allowed_positions and base_positions:
+            filtered = [pos for pos in base_positions if pos in allowed_positions]
+            if filtered:
+                base_positions = filtered
+        if base_positions:
+            base_metadata["base_positions"] = tuple(base_positions)
+        base_positions_for_variants = base_positions or list(record.positions)
+
+        base_record_positions = list(record.positions)
+        if not base_record_positions and base_positions:
+            base_record_positions = list(base_positions)
+        expanded.append(
+            record.model_copy(
+                update={
+                    "positions": base_record_positions,
+                    "metadata": base_metadata,
+                }
+            )
+        )
+
+        eligible_positions = base_positions_for_variants or list(record.positions)
+        if allowed_positions and eligible_positions:
+            if not any(pos in allowed_positions for pos in eligible_positions):
+                continue
+
+        for role, multiplier in role_map.items():
+            role_metadata = dict(base_metadata)
+            role_metadata["single_game_role"] = role
+            role_metadata["single_game_multiplier"] = multiplier
+            baseline = float(role_metadata.get("baseline_projection", record.projection))
+            role_metadata["baseline_projection"] = baseline * multiplier
+            variant_id = f"{record.player_id}__{role}"
+            expanded.append(
+                record.model_copy(
+                    update={
+                        "player_id": variant_id,
+                        "positions": [role],
+                        "projection": record.projection * multiplier,
+                        "metadata": role_metadata,
+                    }
+                )
+            )
+    return expanded
 
 
 def _apply_bias_to_records(
@@ -820,15 +922,19 @@ def _build_lineups_serial(
 
     active_records = _filter_player_pool(list(records), mandatory_ids=lock_player_ids)
     optimizer = get_optimizer(_resolve_site(site), _resolve_sport(sport))
-    if min_salary is not None and hasattr(optimizer, "min_salary_cap"):
-        optimizer.min_salary_cap = min_salary
+    if min_salary is not None:
+        if hasattr(optimizer, "set_min_salary_cap"):
+            optimizer.set_min_salary_cap(min_salary)
+        elif hasattr(optimizer, "min_salary_cap"):
+            optimizer.min_salary_cap = min_salary
     logger.info(
         "Optimizer salary caps – max=%s min=%s",
         getattr(optimizer, "max_salary", None),
         getattr(optimizer, "min_salary_cap", None),
     )
 
-    dfs_players = _to_pydfs_players(active_records)
+    expanded_records = _expand_single_game_records(active_records, site=site, sport=sport)
+    dfs_players = _to_pydfs_players(expanded_records)
     optimizer.player_pool.load_players(dfs_players)
 
     pool = optimizer.player_pool
@@ -853,7 +959,7 @@ def _build_lineups_serial(
 
     baseline_lookup = {
         record.player_id: float(record.metadata.get("baseline_projection", record.projection))
-        for record in active_records
+        for record in expanded_records
     }
 
     results: List[LineupResult] = []

@@ -34,7 +34,7 @@ from pydfs.api.schemas import (
     PoolFilteredLineup,
     PoolFilterSummary,
 )
-from pydfs.ingest import merge_player_and_projection_files
+from pydfs.ingest import infer_site_variant, load_projection_csv, merge_player_and_projection_files
 from pydfs.ingest.projections import MergeReport
 from pydfs.models import PlayerRecord
 from pydfs.optimizer import LineupGenerationPartial, build_lineups
@@ -2578,6 +2578,16 @@ def create_app() -> FastAPI:
             if not effective_projection_mapping:
                 effective_projection_mapping = dict(slate.projection_mapping)
 
+        players_rows = load_projection_csv(
+            players_path,
+            mapping=effective_players_mapping or None,
+        )
+        resolved_site, resolved_sport = infer_site_variant(
+            resolved_site,
+            resolved_sport,
+            players_rows,
+        )
+
         use_cached_records = slate is not None and players_bytes is None and projections_bytes is None and new_players_uploaded is False and new_projections_uploaded is False and players_path in cleanup_paths and projections_path in cleanup_paths
 
         if use_cached_records and slate is not None:
@@ -2591,6 +2601,7 @@ def create_app() -> FastAPI:
                 sport=resolved_sport,
                 players_mapping=effective_players_mapping or None,
                 projection_mapping=effective_projection_mapping or None,
+                players_rows=players_rows,
             )
             report = _report_to_mapping(merge_report)
 

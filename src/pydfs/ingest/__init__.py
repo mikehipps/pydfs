@@ -2,6 +2,7 @@
 
 from .projections import (
     ProjectionRow,
+    infer_site_variant,
     load_projection_csv,
     load_records_from_csv,
     merge_player_and_projection_files,
@@ -14,4 +15,5 @@ __all__ = [
     "merge_player_and_projection_files",
     "rows_to_records",
     "load_records_from_csv",
+    "infer_site_variant",
 ]

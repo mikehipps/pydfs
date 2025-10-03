@@ -51,6 +51,57 @@ _ROSTER_RULES: Dict[Tuple[str, str], RosterRules] = {
         team_max_players=4,
         stacking_slots={"QB", "RB", "WR", "TE", "FLEX"},
     ),
+    ("FD_SINGLE", "NFL"): RosterRules(
+        site="FD_SINGLE",
+        sport="NFL",
+        salary_cap=60_000,
+        roster_order=("MVP", "UTIL", "UTIL", "UTIL", "UTIL"),
+        slot_positions={
+            "MVP": {"MVP"},
+            "UTIL": {"QB", "RB", "WR", "TE", "K"},
+        },
+        team_max_players=4,
+        stacking_slots={"UTIL"},
+    ),
+    ("FD_SINGLE", "NBA"): RosterRules(
+        site="FD_SINGLE",
+        sport="NBA",
+        salary_cap=60_000,
+        roster_order=("MVP", "STAR", "PRO", "UTIL", "UTIL"),
+        slot_positions={
+            "MVP": {"MVP"},
+            "STAR": {"STAR"},
+            "PRO": {"PRO"},
+            "UTIL": {"PG", "SG", "SF", "PF", "C"},
+        },
+        team_max_players=4,
+        stacking_slots={"UTIL"},
+    ),
+    ("FD_SINGLE", "MLB"): RosterRules(
+        site="FD_SINGLE",
+        sport="MLB",
+        salary_cap=60_000,
+        roster_order=("MVP", "STAR", "UTIL", "UTIL", "UTIL"),
+        slot_positions={
+            "MVP": {"MVP"},
+            "STAR": {"STAR"},
+            "UTIL": {"1B", "2B", "3B", "SS", "OF", "C", "C/1B"},
+        },
+        team_max_players=4,
+        stacking_slots={"UTIL"},
+    ),
+    ("FD_SINGLE", "NHL"): RosterRules(
+        site="FD_SINGLE",
+        sport="NHL",
+        salary_cap=60_000,
+        roster_order=("CAPTAIN", "UTIL", "UTIL", "UTIL", "UTIL"),
+        slot_positions={
+            "CAPTAIN": {"CAPTAIN"},
+            "UTIL": {"C", "W", "D"},
+        },
+        team_max_players=4,
+        stacking_slots={"UTIL"},
+    ),
 }
 
 

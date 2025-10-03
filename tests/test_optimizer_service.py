@@ -4,7 +4,12 @@ import pytest
 
 from pydfs.models import PlayerRecord
 from pydfs.optimizer import build_lineups
-from pydfs.optimizer.service import _perturb_projections, _perturbation_window, _apply_bias_to_records
+from pydfs.optimizer.service import (
+    _apply_bias_to_records,
+    _expand_single_game_records,
+    _perturb_projections,
+    _perturbation_window,
+)
 
 
 def _sample_pool() -> list[PlayerRecord]:
@@ -124,3 +129,43 @@ def test_apply_bias_to_records_adjusts_projection():
     assert biased[1].projection == pytest.approx(6.4)
     assert biased[0].metadata["bias_factor"] == pytest.approx(1.2)
     assert biased[1].metadata["bias_factor"] == pytest.approx(0.8)
+
+
+def test_expand_single_game_records_creates_variants():
+    base = PlayerRecord(
+        player_id="p1",
+        name="Quarterback",
+        team="DAL",
+        positions=["QB"],
+        salary=9000,
+        projection=20.0,
+        metadata={"baseline_projection": 20.0},
+    )
+
+    expanded = _expand_single_game_records([base], site="FD_SINGLE", sport="NFL")
+    ids = {record.player_id for record in expanded}
+    assert base.player_id in ids
+    assert f"{base.player_id}__MVP" in ids
+    mvp = next(record for record in expanded if record.player_id.endswith("__MVP"))
+    assert mvp.projection == pytest.approx(30.0)
+    assert mvp.positions == ["MVP"]
+    assert mvp.metadata["single_game_role"] == "MVP"
+
+
+def test_build_lineups_single_game_generates_mvp_slot():
+    pool = [
+        PlayerRecord(player_id="qb1", name="Quarterback", team="DAL", positions=["QB"], salary=9000, projection=20.0),
+        PlayerRecord(player_id="rb1", name="Running Back 1", team="DAL", positions=["RB"], salary=7500, projection=16.0),
+        PlayerRecord(player_id="wr1", name="Wide Receiver 1", team="PHI", positions=["WR"], salary=7200, projection=15.0),
+        PlayerRecord(player_id="wr2", name="Wide Receiver 2", team="PHI", positions=["WR"], salary=6800, projection=14.2),
+        PlayerRecord(player_id="te1", name="Tight End", team="DAL", positions=["TE"], salary=6400, projection=13.0),
+        PlayerRecord(player_id="k1", name="Kicker", team="PHI", positions=["K"], salary=5000, projection=9.5),
+    ]
+
+    output = build_lineups(pool, site="FD_SINGLE", sport="NFL", n_lineups=1, max_exposure=1.0)
+
+    assert len(output.lineups) == 1
+    lineup = output.lineups[0]
+    assert len(lineup.players) == 5
+    assert any("MVP" in player.positions for player in lineup.players)
+    assert any(player.player_id.endswith("__MVP") for player in lineup.players)

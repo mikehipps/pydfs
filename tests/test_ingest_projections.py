@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from pydfs.ingest import ProjectionRow, merge_player_and_projection_files, rows_to_records
+from pydfs.ingest import (
+    ProjectionRow,
+    infer_site_variant,
+    merge_player_and_projection_files,
+    rows_to_records,
+)
 
 
 def _row(**kwargs):
@@ -35,6 +40,31 @@ def test_rows_to_records_nfl_defense():
 
     records = rows_to_records([row], site="FD", sport="NFL")
     assert records[0].positions == ["D"]
+
+
+def test_rows_to_records_single_game_defense_position_inferred():
+    row = _row(
+        player_id="sgd",
+        name="Dallas Cowboys D/ST",
+        team="DAL",
+        position="",
+        salary="7000",
+        projection="6.8",
+    )
+
+    records = rows_to_records([row], site="FD", sport="NFL")
+    assert records[0].positions == ["D"]
+
+
+def test_infer_site_variant_detects_single_game_tokens():
+    rows = [
+        _row(player_id="p1", name="Player One", team="BOS", position="MVP", salary="12000", projection="35"),
+        _row(player_id="p2", name="Player Two", team="LAL", position="STAR", salary="10500", projection="28"),
+    ]
+
+    site, sport = infer_site_variant("FD", "NBA", rows)
+    assert site == "FD_SINGLE"
+    assert sport == "NBA"
 
 
 def test_merge_players_and_projections(tmp_path: Path):

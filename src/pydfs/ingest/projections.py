@@ -199,6 +199,30 @@ def _parse_flag(value: Optional[str]) -> Optional[bool]:
     return None
 
 
+_SINGLE_GAME_ROLE_TOKENS = {"MVP", "STAR", "PRO", "CAPTAIN"}
+
+
+def infer_site_variant(site: str, sport: str, rows: Sequence["ProjectionRow"]) -> tuple[str, str]:
+    """Infer adjusted site/sport keys based on roster hints in the player rows."""
+
+    site_key = site.upper()
+    sport_key = sport.upper()
+    if site_key != "FD":
+        return site_key, sport_key
+
+    role_tokens: set[str] = set()
+    for row in rows:
+        raw = (row.raw_position or "").strip()
+        if not raw:
+            continue
+        parts = re.split(r"[/,\\s]+", raw)
+        role_tokens.update(part.upper() for part in parts if part)
+
+    if role_tokens & _SINGLE_GAME_ROLE_TOKENS:
+        return "FD_SINGLE", sport_key
+    return site_key, sport_key
+
+
 def _canonical_positions(site: str, sport: str, position: Optional[str]) -> List[str]:
     if not position:
         return []
@@ -226,6 +250,8 @@ def rows_to_records(
     records: List[PlayerRecord] = []
     for row in rows:
         positions = _canonical_positions(site, sport, row.raw_position)
+        if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
+            positions = ["D"]
         metadata = {}
         if row.ownership is not None:
             metadata["projected_ownership"] = row.ownership
@@ -263,6 +289,20 @@ def load_records_from_csv(
 
 _NAME_SUFFIX_TOKENS = {"jr", "sr", "ii", "iii", "iv", "v"}
 _DEFENSE_TOKENS = {"dst", "defense", "def", "d"}
+_SINGLE_GAME_DEFENSE_PATTERN = re.compile(r"\b(?:D/?ST|DST|DEF(?:ENSE)?)\b", re.IGNORECASE)
+
+
+def _is_fanduel_single_game_defense(
+    row: ProjectionRow, *, site: str, sport: str
+) -> bool:
+    if site.upper() not in {"FD", "FD_SINGLE"} or sport.upper() != "NFL":
+        return False
+    position = row.raw_position or ""
+    if position.strip():
+        return False
+    if not row.raw_name:
+        return False
+    return bool(_SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name))
 
 
 def _normalize_name(name: str, *, is_defense: bool = False, team: str | None = None) -> str:
@@ -290,8 +330,11 @@ def merge_player_and_projection_files(
     sport: str,
     players_mapping: Optional[Mapping[str, str]] = None,
     projection_mapping: Optional[Mapping[str, str]] = None,
+    players_rows: Sequence[ProjectionRow] | None = None,
+    projection_rows: Sequence[ProjectionRow] | None = None,
 ) -> Tuple[List[PlayerRecord], MergeReport]:
-    players_rows = load_projection_csv(players_path, mapping=players_mapping or DEFAULT_PLAYERS_MAPPING)
+    if players_rows is None:
+        players_rows = load_projection_csv(players_path, mapping=players_mapping or DEFAULT_PLAYERS_MAPPING)
     base_records = {}
     for row, record in zip(players_rows, rows_to_records(players_rows, site=site, sport=sport)):
         key = _record_key(row.raw_name, record.team, is_defense="D" in record.positions)
@@ -309,11 +352,15 @@ def merge_player_and_projection_files(
         )
         return list(base_records.values()), report
 
-    overlay_rows = load_projection_csv(projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING)
+    overlay_rows = projection_rows or load_projection_csv(
+        projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING
+    )
     overlay_created_keys: set[str] = set()
     for row in overlay_rows:
         team_abbrev = _canonical_team(row.raw_team, sport)
         positions = _canonical_positions(site, sport, row.raw_position)
+        if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
+            positions = ["D"]
         is_defense = "D" in positions
         key = _record_key(row.raw_name, team_abbrev, is_defense=is_defense)
         if key not in base_records:

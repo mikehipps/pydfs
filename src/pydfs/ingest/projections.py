@@ -226,6 +226,8 @@ def rows_to_records(
     records: List[PlayerRecord] = []
     for row in rows:
         positions = _canonical_positions(site, sport, row.raw_position)
+        if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
+            positions = ["D"]
         metadata = {}
         if row.ownership is not None:
             metadata["projected_ownership"] = row.ownership
@@ -263,6 +265,20 @@ def load_records_from_csv(
 
 _NAME_SUFFIX_TOKENS = {"jr", "sr", "ii", "iii", "iv", "v"}
 _DEFENSE_TOKENS = {"dst", "defense", "def", "d"}
+_SINGLE_GAME_DEFENSE_PATTERN = re.compile(r"\b(?:D/?ST|DST|DEF(?:ENSE)?)\b", re.IGNORECASE)
+
+
+def _is_fanduel_single_game_defense(
+    row: ProjectionRow, *, site: str, sport: str
+) -> bool:
+    if site.upper() != "FD" or sport.upper() != "NFL":
+        return False
+    position = row.raw_position or ""
+    if position.strip():
+        return False
+    if not row.raw_name:
+        return False
+    return bool(_SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name))
 
 
 def _normalize_name(name: str, *, is_defense: bool = False, team: str | None = None) -> str:
@@ -314,6 +330,8 @@ def merge_player_and_projection_files(
     for row in overlay_rows:
         team_abbrev = _canonical_team(row.raw_team, sport)
         positions = _canonical_positions(site, sport, row.raw_position)
+        if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
+            positions = ["D"]
         is_defense = "D" in positions
         key = _record_key(row.raw_name, team_abbrev, is_defense=is_defense)
         if key not in base_records:

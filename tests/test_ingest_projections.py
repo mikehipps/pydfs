@@ -37,6 +37,20 @@ def test_rows_to_records_nfl_defense():
     assert records[0].positions == ["D"]
 
 
+def test_rows_to_records_single_game_defense_position_inferred():
+    row = _row(
+        player_id="sgd",
+        name="Dallas Cowboys D/ST",
+        team="DAL",
+        position="",
+        salary="7000",
+        projection="6.8",
+    )
+
+    records = rows_to_records([row], site="FD", sport="NFL")
+    assert records[0].positions == ["D"]
+
+
 def test_merge_players_and_projections(tmp_path: Path):
     players_csv = tmp_path / "players.csv"
     players_csv.write_text(

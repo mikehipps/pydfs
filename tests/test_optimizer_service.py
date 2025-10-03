@@ -124,3 +124,23 @@ def test_apply_bias_to_records_adjusts_projection():
     assert biased[1].projection == pytest.approx(6.4)
     assert biased[0].metadata["bias_factor"] == pytest.approx(1.2)
     assert biased[1].metadata["bias_factor"] == pytest.approx(0.8)
+
+
+def test_build_lineups_single_game_includes_defense():
+    pool = [
+        PlayerRecord(player_id="qb1", name="Quarterback", team="DAL", positions=["QB"], salary=9000, projection=20.0),
+        PlayerRecord(player_id="rb1", name="Running Back 1", team="DAL", positions=["RB"], salary=7000, projection=15.0),
+        PlayerRecord(player_id="rb2", name="Running Back 2", team="PHI", positions=["RB"], salary=6500, projection=14.0),
+        PlayerRecord(player_id="rb3", name="Flex Back", team="NYG", positions=["RB"], salary=6000, projection=13.0),
+        PlayerRecord(player_id="wr1", name="Wide Receiver 1", team="DAL", positions=["WR"], salary=7500, projection=16.0),
+        PlayerRecord(player_id="wr2", name="Wide Receiver 2", team="PHI", positions=["WR"], salary=6000, projection=14.5),
+        PlayerRecord(player_id="wr3", name="Wide Receiver 3", team="NYG", positions=["WR"], salary=5500, projection=13.5),
+        PlayerRecord(player_id="te1", name="Tight End", team="DAL", positions=["TE"], salary=5000, projection=12.0),
+        PlayerRecord(player_id="def", name="Philadelphia Defense", team="PHI", positions=["D"], salary=4500, projection=9.0),
+    ]
+
+    output = build_lineups(pool, site="FD", sport="NFL", n_lineups=1, max_exposure=1.0)
+
+    assert len(output.lineups) == 1
+    lineup = output.lineups[0]
+    assert any(player.player_id == "def" for player in lineup.players)

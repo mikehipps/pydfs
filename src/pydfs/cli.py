@@ -8,7 +8,12 @@ import json
 from pathlib import Path
 
 from pydfs.config_loader import MappingProfile
-from pydfs.ingest import load_records_from_csv, merge_player_and_projection_files
+from pydfs.ingest import (
+    infer_site_variant,
+    load_projection_csv,
+    load_records_from_csv,
+    merge_player_and_projection_files,
+)
 from pydfs.optimizer import LineupGenerationPartial, build_lineups
 
 
@@ -138,14 +143,27 @@ def main() -> None:
         players_mapping = profile.players_mapping | players_mapping
         projection_mapping = profile.projection_mapping | projection_mapping
 
+    resolved_site = args.site
+    resolved_sport = args.sport
+
     if args.players:
+        players_rows = load_projection_csv(
+            args.players,
+            mapping=players_mapping or None,
+        )
+        resolved_site, resolved_sport = infer_site_variant(
+            resolved_site,
+            resolved_sport,
+            players_rows,
+        )
         records, report = merge_player_and_projection_files(
             players_path=args.players,
             projections_path=args.projections,
-            site=args.site,
-            sport=args.sport,
+            site=resolved_site,
+            sport=resolved_sport,
             players_mapping=players_mapping or None,
             projection_mapping=projection_mapping or None,
+            players_rows=players_rows,
         )
         if args.save_profile:
             MappingProfile(players_mapping, projection_mapping).save(args.save_profile)
@@ -176,8 +194,8 @@ def main() -> None:
     else:
         records = load_records_from_csv(
             args.projections,
-            site=args.site,
-            sport=args.sport,
+            site=resolved_site,
+            sport=resolved_sport,
             mapping=projection_mapping or None,
         )
         if args.save_profile:
@@ -193,8 +211,8 @@ def main() -> None:
     try:
         build_output = build_lineups(
             records,
-            site=args.site,
-            sport=args.sport,
+            site=resolved_site,
+            sport=resolved_sport,
             n_lineups=args.lineups,
             lock_player_ids=args.lock,
             exclude_player_ids=args.exclude,

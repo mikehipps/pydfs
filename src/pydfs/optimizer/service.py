@@ -268,6 +268,11 @@ def _to_pydfs_players(records: Sequence[PlayerRecord]):
     dfs_players: List[PydfsPlayer] = []
     for record in records:
         first, last = _split_name(record.name)
+        base_positions = record.metadata.get("base_positions")
+        if base_positions:
+            base_positions_list = list(base_positions)
+        else:
+            base_positions_list = list(record.positions) if record.positions else None
         dfs_players.append(
             PydfsPlayer(
                 player_id=record.player_id,
@@ -280,6 +285,7 @@ def _to_pydfs_players(records: Sequence[PlayerRecord]):
                 projected_ownership=record.metadata.get("projected_ownership"),
                 fppg_floor=record.metadata.get("projection_floor"),
                 fppg_ceil=record.metadata.get("projection_ceil"),
+                original_positions=base_positions_list,
             )
         )
     return dfs_players
@@ -347,6 +353,11 @@ def _expand_single_game_records(
         base_metadata = dict(record.metadata)
         base_metadata.setdefault("base_player_id", record.player_id)
         existing_positions = set(record.positions)
+        metadata_positions = base_metadata.get("base_positions")
+        base_positions = list(record.positions)
+        if metadata_positions and not base_positions:
+            base_positions = list(metadata_positions)
+        base_positions = [pos for pos in base_positions if pos]
         if existing_positions and existing_positions.issubset(set(role_map.keys())):
             role = next(iter(existing_positions))
             role_metadata = dict(base_metadata)
@@ -359,10 +370,32 @@ def _expand_single_game_records(
             continue
 
         base_metadata.setdefault("single_game_role", "BASE")
-        expanded.append(record.model_copy(update={"metadata": base_metadata}))
+        base_metadata.setdefault("single_game_multiplier", 1.0)
+        if not base_positions and metadata_positions:
+            base_positions = list(metadata_positions)
+        if allowed_positions and base_positions:
+            filtered = [pos for pos in base_positions if pos in allowed_positions]
+            if filtered:
+                base_positions = filtered
+        if base_positions:
+            base_metadata["base_positions"] = tuple(base_positions)
+        base_positions_for_variants = base_positions or list(record.positions)
 
-        if allowed_positions and record.positions:
-            if not any(pos in allowed_positions for pos in record.positions):
+        base_record_positions = list(record.positions)
+        if not base_record_positions and base_positions:
+            base_record_positions = list(base_positions)
+        expanded.append(
+            record.model_copy(
+                update={
+                    "positions": base_record_positions,
+                    "metadata": base_metadata,
+                }
+            )
+        )
+
+        eligible_positions = base_positions_for_variants or list(record.positions)
+        if allowed_positions and eligible_positions:
+            if not any(pos in allowed_positions for pos in eligible_positions):
                 continue
 
         for role, multiplier in role_map.items():

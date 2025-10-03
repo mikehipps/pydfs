@@ -152,6 +152,25 @@ def test_expand_single_game_records_creates_variants():
     assert mvp.metadata["single_game_role"] == "MVP"
 
 
+def test_expand_single_game_records_uses_base_positions_metadata():
+    base = PlayerRecord(
+        player_id="wr1",
+        name="Star Receiver",
+        team="DAL",
+        positions=[],
+        salary=11000,
+        projection=24.5,
+        metadata={"baseline_projection": 24.5, "base_positions": ("WR",)},
+    )
+
+    expanded = _expand_single_game_records([base], site="FD_SINGLE", sport="NFL")
+    base_variant = next(record for record in expanded if record.player_id == "wr1")
+    assert base_variant.positions == ["WR"]
+    assert base_variant.metadata["base_positions"] == ("WR",)
+    mvp_variant = next(record for record in expanded if record.player_id.endswith("__MVP"))
+    assert mvp_variant.metadata["base_positions"] == ("WR",)
+
+
 def test_build_lineups_single_game_generates_mvp_slot():
     pool = [
         PlayerRecord(player_id="qb1", name="Quarterback", team="DAL", positions=["QB"], salary=9000, projection=20.0),

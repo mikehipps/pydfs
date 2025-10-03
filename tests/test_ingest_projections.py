@@ -56,6 +56,48 @@ def test_rows_to_records_single_game_defense_position_inferred():
     assert records[0].positions == ["D"]
 
 
+def test_rows_to_records_single_game_uses_fallback_by_id():
+    row = _row(
+        player_id="qb1",
+        name="Kirk Cousins",
+        team="MIN",
+        position="",
+        salary="15000",
+        projection="17.4",
+    )
+
+    records = rows_to_records(
+        [row],
+        site="FD_SINGLE",
+        sport="NFL",
+        fallback_positions_by_id={"qb1": ("QB",)},
+    )
+
+    assert records[0].positions == ["QB"]
+    assert records[0].metadata["base_positions"] == ("QB",)
+
+
+def test_rows_to_records_single_game_uses_fallback_by_name():
+    row = _row(
+        player_id="",
+        name="Justin Jefferson",
+        team="MIN",
+        position="",
+        salary="16500",
+        projection="20.1",
+    )
+
+    records = rows_to_records(
+        [row],
+        site="FD_SINGLE",
+        sport="NFL",
+        fallback_positions_by_key={"justinjefferson::MIN": ("WR",)},
+    )
+
+    assert records[0].positions == ["WR"]
+    assert records[0].metadata["base_positions"] == ("WR",)
+
+
 def test_infer_site_variant_detects_single_game_tokens():
     rows = [
         _row(player_id="p1", name="Player One", team="BOS", position="MVP", salary="12000", projection="35"),

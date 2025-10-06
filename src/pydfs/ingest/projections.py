@@ -70,6 +70,22 @@ def _build_alias_lookup() -> dict[str, dict[str, str]]:
 TEAM_ALIAS_LOOKUP = _build_alias_lookup()
 
 
+def _infer_team_from_name(name: str, sport: str) -> str | None:
+    token = _team_token(name)
+    if not token:
+        return None
+    lookup = TEAM_ALIAS_LOOKUP.get(sport.upper())
+    if not lookup:
+        return None
+    if token in lookup:
+        return lookup[token]
+    cleaned_name = re.sub(r"\b(?:D/?ST|DST|DEF(?:ENSE)?)\b", "", name, flags=re.IGNORECASE)
+    cleaned_token = _team_token(cleaned_name)
+    if cleaned_token and cleaned_token in lookup:
+        return lookup[cleaned_token]
+    return None
+
+
 class ProjectionRow(BaseModel):
     raw_id: Optional[str] = None
     raw_name: str
@@ -256,11 +272,20 @@ def rows_to_records(
     records: List[PlayerRecord] = []
     fallback_positions_by_id = fallback_positions_by_id or {}
     fallback_positions_by_key = fallback_positions_by_key or {}
+    sport_upper = sport.upper()
     for row in rows:
         positions = _canonical_positions(site, sport, row.raw_position)
         if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
             positions = ["D"]
         team_abbrev = _canonical_team(row.raw_team, sport) if row.raw_team else ""
+        if (
+            not team_abbrev
+            and sport_upper == "NFL"
+            and ("D" in positions or _SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name or ""))
+        ):
+            inferred_team = _infer_team_from_name(row.raw_name, sport)
+            if inferred_team:
+                team_abbrev = inferred_team
         fallback_positions: Sequence[str] | None = None
         if not positions and row.raw_id:
             fallback_positions = fallback_positions_by_id.get(row.raw_id)
@@ -443,14 +468,24 @@ def merge_player_and_projection_files(
         projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING
     )
     overlay_created_keys: set[str] = set()
+    sport_upper = sport.upper()
     for row in overlay_rows:
-        team_abbrev = _canonical_team(row.raw_team, sport)
         positions = _canonical_positions(site, sport, row.raw_position)
         if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
             positions = ["D"]
         fallback_positions: Sequence[str] | None = None
         if row.raw_id:
             fallback_positions = fallback_positions_by_id.get(row.raw_id)
+        team_abbrev = _canonical_team(row.raw_team, sport)
+        defense_name = (
+            "D" in positions
+            or (fallback_positions and any(pos == "D" for pos in fallback_positions))
+            or _SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name or "")
+        )
+        if not team_abbrev and sport_upper == "NFL" and defense_name:
+            inferred_team = _infer_team_from_name(row.raw_name, sport)
+            if inferred_team:
+                team_abbrev = inferred_team
         if not fallback_positions:
             fallback_positions = fallback_positions_by_key.get(
                 _record_key(row.raw_name, team_abbrev, is_defense=False)

@@ -27,6 +27,7 @@ from pydfs.api.schemas import (
     LineupPlayerResponse,
     LineupRequest,
     LineupResponse,
+    ManualReviewItemResponse,
     MappingPreviewResponse,
     PlayerUsageResponse,
     PoolFilterRequest,
@@ -51,6 +52,8 @@ DEFAULT_PLAYERS_MAPPING = {
     "position": "Position",
     "salary": "Salary",
     "projection": "FPPG",
+    "game": "Game",
+    "opponent": "Opponent",
 }
 
 DEFAULT_PROJECTION_MAPPING = {
@@ -170,6 +173,20 @@ def _report_to_mapping(report: MappingPreviewResponse | MergeReport | dict) -> M
             matched_players=report.matched_players,
             players_missing_projection=report.players_missing_projection,
             unmatched_projection_rows=report.unmatched_projection_rows,
+            manual_review=[
+                ManualReviewItemResponse(
+                    identifier=item.identifier,
+                    name=item.name,
+                    team=item.team,
+                    team_abbreviation=item.team_abbreviation or None,
+                    projection=item.projection,
+                    salary=item.salary,
+                    game=item.game,
+                    reason=item.reason,
+                )
+                for item in report.manual_review
+            ],
+            ignored_projection_rows=report.ignored_projection_rows,
         )
     if isinstance(report, dict):
         return MappingPreviewResponse.model_validate(report)

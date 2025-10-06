@@ -60,9 +60,11 @@ def _assign_slots(
     *,
     slot_order: Sequence[str],
     slot_positions: Mapping[str, Iterable[str]],
-) -> dict[str, LineupPlayerResponse]:
+) -> list[LineupPlayerResponse]:
+    """Return players matched to roster slots preserving slot order."""
+
     remaining = list(lineup.players)
-    assignments: dict[str, LineupPlayerResponse] = {}
+    assignments: list[LineupPlayerResponse] = []
 
     for slot in slot_order:
         allowed = set(slot_positions.get(slot, {slot}))
@@ -75,7 +77,7 @@ def _assign_slots(
             raise ContestExportError(
                 f"Lineup {lineup.lineup_id} missing player for slot {slot}"
             )
-        assignments[slot] = remaining.pop(match_index)
+        assignments.append(remaining.pop(match_index))
 
     if remaining:
         raise ContestExportError(
@@ -112,8 +114,7 @@ def export_lineups_to_csv(
             slot_positions=rules.slot_positions,
         )
         row = [entry_name]
-        for slot in template.slot_order:
-            player = assignments[slot]
+        for player in assignments:
             row.append(player.player_id)
         writer.writerow(row)
 

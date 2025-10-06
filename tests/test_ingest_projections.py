@@ -216,3 +216,122 @@ def test_merge_handles_defense_names(tmp_path: Path):
     assert report.matched_players == 1
     assert records[0].team == "MIA"
     assert records[0].positions == ["D"]
+
+
+def test_merge_flags_manual_review_for_roster_mismatch(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "1,QB,Joe,Burrow,CIN,9000,20.1\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Backup Bengals Player,CIN,$4500,8.2\n"
+    )
+
+    _, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert len(report.manual_review) == 1
+    item = report.manual_review[0]
+    assert item.name == "Backup Bengals Player"
+    assert item.team_abbreviation == "CIN"
+    assert report.ignored_projection_rows == []
+
+
+def test_merge_ignores_out_of_slate_projections(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "1,QB,Joe,Burrow,CIN,9000,20.1\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Dak Prescott,DAL,$8500,22.4\n"
+    )
+
+    _, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert report.manual_review == []
+    assert report.ignored_projection_rows == ["Dak Prescott"]
+
+
+def test_merge_manual_override_resolves_unmatched_projection(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "5,WR,John,Doe,CIN,6500,9.4\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Johnny Doe,CIN,$6600,12.5\n"
+    )
+
+    records, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert len(records) == 0
+    assert report.manual_review and report.manual_review[0].name == "Johnny Doe"
+
+    manual_key = "|Johnny Doe|CIN|"
+    records_override, report_override = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+        manual_overrides={manual_key: "5"},
+    )
+
+    assert report_override.manual_review == []
+    assert report_override.matched_players == 1
+    assert records_override[0].projection == pytest.approx(12.5)
+    assert records_override[0].player_id == "5"
+
+
+def test_merge_infers_defense_team_from_name(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "20,DEF,Baltimore,Ravens,,4600,6.2\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Baltimore D/ST,,4500,7.5\n"
+    )
+
+    records, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert report.matched_players == 1
+    assert records[0].team == "BAL"
+    assert records[0].positions == ["D"]

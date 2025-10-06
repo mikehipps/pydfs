@@ -70,6 +70,22 @@ def _build_alias_lookup() -> dict[str, dict[str, str]]:
 TEAM_ALIAS_LOOKUP = _build_alias_lookup()
 
 
+def _infer_team_from_name(name: str, sport: str) -> str | None:
+    token = _team_token(name)
+    if not token:
+        return None
+    lookup = TEAM_ALIAS_LOOKUP.get(sport.upper())
+    if not lookup:
+        return None
+    if token in lookup:
+        return lookup[token]
+    cleaned_name = re.sub(r"\b(?:D/?ST|DST|DEF(?:ENSE)?)\b", "", name, flags=re.IGNORECASE)
+    cleaned_token = _team_token(cleaned_name)
+    if cleaned_token and cleaned_token in lookup:
+        return lookup[cleaned_token]
+    return None
+
+
 class ProjectionRow(BaseModel):
     raw_id: Optional[str] = None
     raw_name: str
@@ -80,6 +96,8 @@ class ProjectionRow(BaseModel):
     ownership: float | None = Field(default=None, ge=0.0)
     raw_injury_status: Optional[str] = None
     raw_probable_pitcher: Optional[str] = None
+    raw_game: Optional[str] = None
+    raw_opponent: Optional[str] = None
 
     @classmethod
     def from_mapping(cls, row: Mapping[str, str], mapping: Mapping[str, str]) -> "ProjectionRow":
@@ -121,6 +139,8 @@ class ProjectionRow(BaseModel):
             "ownership": ownership_value,
             "raw_injury_status": extract(parse_spec("injury_status")),
             "raw_probable_pitcher": extract(parse_spec("probable_pitcher")),
+            "raw_game": extract(parse_spec("game")),
+            "raw_opponent": extract(parse_spec("opponent")),
         }
         return cls(**data)
 
@@ -144,6 +164,8 @@ DEFAULT_PLAYERS_MAPPING = {
     "projection": "FPPG",
     "injury_status": "Injury Indicator",
     "probable_pitcher": "Probable Pitcher",
+    "game": "Game",
+    "opponent": "Opponent",
 }
 
 
@@ -256,11 +278,20 @@ def rows_to_records(
     records: List[PlayerRecord] = []
     fallback_positions_by_id = fallback_positions_by_id or {}
     fallback_positions_by_key = fallback_positions_by_key or {}
+    sport_upper = sport.upper()
     for row in rows:
         positions = _canonical_positions(site, sport, row.raw_position)
         if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
             positions = ["D"]
         team_abbrev = _canonical_team(row.raw_team, sport) if row.raw_team else ""
+        if (
+            not team_abbrev
+            and sport_upper == "NFL"
+            and ("D" in positions or _SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name or ""))
+        ):
+            inferred_team = _infer_team_from_name(row.raw_name, sport)
+            if inferred_team:
+                team_abbrev = inferred_team
         fallback_positions: Sequence[str] | None = None
         if not positions and row.raw_id:
             fallback_positions = fallback_positions_by_id.get(row.raw_id)
@@ -350,6 +381,56 @@ def _record_key(name: str, team: str, *, is_defense: bool = False) -> str:
     return f"{_normalize_name(name, is_defense=is_defense, team=team)}::{team}"
 
 
+def _projection_identifier(row: ProjectionRow) -> str:
+    parts = [
+        (row.raw_id or "").strip(),
+        row.raw_name.strip(),
+        (row.raw_team or "").strip(),
+        (row.raw_game or "").strip(),
+    ]
+    return "|".join(parts)
+
+
+def _extract_game_teams(value: Optional[str], sport: str) -> list[str]:
+    if not value:
+        return []
+    text = value.upper()
+    # Replace common separators with a single delimiter
+    normalized = re.sub(r"\s+AT\s+", " @ ", text)
+    normalized = re.sub(r"\s+VS\.?\s+", " v ", normalized)
+    normalized = normalized.replace("VS.", " v ").replace("VS", " v ")
+    tokens = re.split(r"[@Vv/\\-]", normalized)
+    teams: list[str] = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        abbrev = _canonical_team(token, sport)
+        if abbrev:
+            teams.append(abbrev)
+    return teams
+
+
+def _projection_row_in_slate(
+    row: ProjectionRow,
+    *,
+    sport: str,
+    team_codes: set[str],
+) -> bool:
+    candidates: set[str] = set()
+    if row.raw_team:
+        candidates.add(_canonical_team(row.raw_team, sport))
+    if row.raw_opponent:
+        candidates.add(_canonical_team(row.raw_opponent, sport))
+    candidates.update(_extract_game_teams(row.raw_game, sport))
+    if sport.upper() == "NFL" and not row.raw_team:
+        inferred = _infer_team_from_name(row.raw_name, sport)
+        if inferred:
+            candidates.add(inferred)
+    candidates.discard("")
+    return any(team in team_codes for team in candidates)
+
+
 def _load_single_game_position_lookup(
     players_path: Path,
     sport: str,
@@ -398,6 +479,7 @@ def merge_player_and_projection_files(
     projection_mapping: Optional[Mapping[str, str]] = None,
     players_rows: Sequence[ProjectionRow] | None = None,
     projection_rows: Sequence[ProjectionRow] | None = None,
+    manual_overrides: Mapping[str, str] | None = None,
 ) -> Tuple[List[PlayerRecord], MergeReport]:
     if players_rows is None:
         players_rows = load_projection_csv(players_path, mapping=players_mapping or DEFAULT_PLAYERS_MAPPING)
@@ -413,7 +495,9 @@ def merge_player_and_projection_files(
         else:
             logger.debug("Single-game fallback positions unavailable (players file missing)")
 
-    base_records = {}
+    base_records: dict[str, PlayerRecord] = {}
+    keys_by_id: dict[str, str] = {}
+    players_team_codes: set[str] = set()
     for row, record in zip(
         players_rows,
         rows_to_records(
@@ -426,9 +510,16 @@ def merge_player_and_projection_files(
     ):
         key = _record_key(row.raw_name, record.team, is_defense="D" in record.positions)
         base_records[key] = record
+        if record.player_id:
+            keys_by_id[str(record.player_id)] = key
+        if record.team:
+            players_team_codes.add(record.team)
 
     matched_keys: set[str] = set()
     unmatched_projection_rows: List[str] = []
+    manual_review: List[ManualReviewItem] = []
+    ignored_projection_rows: List[str] = []
+    manual_overrides = manual_overrides or {}
 
     if projections_path is None:
         report = MergeReport(
@@ -436,6 +527,8 @@ def merge_player_and_projection_files(
             matched_players=0,
             players_missing_projection=[rec.name for rec in base_records.values()],
             unmatched_projection_rows=[],
+            manual_review=[],
+            ignored_projection_rows=[],
         )
         return list(base_records.values()), report
 
@@ -443,14 +536,24 @@ def merge_player_and_projection_files(
         projections_path, mapping=projection_mapping or DEFAULT_PROJECTION_MAPPING
     )
     overlay_created_keys: set[str] = set()
+    sport_upper = sport.upper()
     for row in overlay_rows:
-        team_abbrev = _canonical_team(row.raw_team, sport)
         positions = _canonical_positions(site, sport, row.raw_position)
         if not positions and _is_fanduel_single_game_defense(row, site=site, sport=sport):
             positions = ["D"]
         fallback_positions: Sequence[str] | None = None
         if row.raw_id:
             fallback_positions = fallback_positions_by_id.get(row.raw_id)
+        team_abbrev = _canonical_team(row.raw_team, sport)
+        defense_name = (
+            "D" in positions
+            or (fallback_positions and any(pos == "D" for pos in fallback_positions))
+            or _SINGLE_GAME_DEFENSE_PATTERN.search(row.raw_name or "")
+        )
+        if not team_abbrev and sport_upper == "NFL" and defense_name:
+            inferred_team = _infer_team_from_name(row.raw_name, sport)
+            if inferred_team:
+                team_abbrev = inferred_team
         if not fallback_positions:
             fallback_positions = fallback_positions_by_key.get(
                 _record_key(row.raw_name, team_abbrev, is_defense=False)
@@ -463,39 +566,43 @@ def merge_player_and_projection_files(
             positions = [pos for pos in fallback_positions if pos]
         is_defense = "D" in positions
         key = _record_key(row.raw_name, team_abbrev, is_defense=is_defense)
+
+        identifier = _projection_identifier(row)
+        override_key: str | None = None
+        override_id = manual_overrides.get(identifier)
+        if override_id and not fallback_positions:
+            fallback_positions = fallback_positions_by_id.get(str(override_id))
+        if override_id:
+            override_key = keys_by_id.get(str(override_id))
+        if override_key:
+            key = override_key
+
         if key not in base_records:
-            # create new record if enough info
-            metadata = {}
-            if row.ownership is not None:
-                metadata["projected_ownership"] = row.ownership
-            projection_value = _parse_projection(row.raw_projection)
-            metadata.setdefault("baseline_projection", projection_value)
-            if positions:
-                metadata.setdefault("base_positions", tuple(positions))
-            elif fallback_positions:
-                metadata.setdefault("base_positions", tuple(fallback_positions))
-            if row.raw_injury_status:
-                metadata["injury_status"] = row.raw_injury_status.strip()
-            flag = _parse_flag(row.raw_probable_pitcher)
-            if flag is not None:
-                metadata["probable_pitcher"] = flag
-            try:
-                base_records[key] = PlayerRecord(
-                    player_id=row.raw_id or row.raw_name,
-                    name=row.raw_name,
-                    team=team_abbrev,
-                    positions=positions,
-                    salary=_parse_salary(row.raw_salary),
-                    projection=projection_value,
-                    metadata=metadata,
+            if _projection_row_in_slate(row, sport=sport, team_codes=players_team_codes):
+                projection_value = _parse_projection(row.raw_projection)
+                try:
+                    salary_value = _parse_salary(row.raw_salary)
+                except ValueError:
+                    salary_value = None
+                manual_review.append(
+                    ManualReviewItem(
+                        identifier=identifier,
+                        name=row.raw_name,
+                        team=row.raw_team,
+                        team_abbreviation=team_abbrev,
+                        projection=projection_value,
+                        salary=salary_value,
+                        game=row.raw_game,
+                        reason="Projection matched slate teams but player not found in roster CSV",
+                    )
                 )
-            except ValueError:
-                unmatched_projection_rows.append(row.raw_name)
-                continue
-            overlay_created_keys.add(key)
+            else:
+                ignored_projection_rows.append(row.raw_name)
             continue
 
         existing = base_records[key]
+        if override_key:
+            team_abbrev = existing.team or team_abbrev
         matched_keys.add(key)
         metadata = dict(existing.metadata)
         if row.ownership is not None:
@@ -524,8 +631,9 @@ def merge_player_and_projection_files(
             chosen_positions = fallback_positions
         if chosen_positions:
             update["positions"] = list(chosen_positions)
-        if row.raw_id:
-            update["player_id"] = row.raw_id
+        resolved_player_id = row.raw_id or (override_id if override_key else None)
+        if resolved_player_id:
+            update["player_id"] = resolved_player_id
         if team_abbrev:
             update["team"] = team_abbrev
 
@@ -559,6 +667,8 @@ def merge_player_and_projection_files(
         matched_players=filtered_matched,
         players_missing_projection=missing_projection,
         unmatched_projection_rows=unmatched_projection_rows,
+        manual_review=manual_review,
+        ignored_projection_rows=ignored_projection_rows,
     )
     return filtered_records, report
 
@@ -569,3 +679,17 @@ class MergeReport:
     matched_players: int
     players_missing_projection: List[str]
     unmatched_projection_rows: List[str]
+    manual_review: List["ManualReviewItem"]
+    ignored_projection_rows: List[str]
+
+
+@dataclass(frozen=True)
+class ManualReviewItem:
+    identifier: str
+    name: str
+    team: str
+    team_abbreviation: str
+    projection: float
+    salary: Optional[int]
+    game: Optional[str]
+    reason: str

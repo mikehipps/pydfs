@@ -1,6 +1,6 @@
 """Pydantic models for API I/O."""
 
-from .mapping import MappingPayload, MappingPreviewResponse
+from .mapping import MappingPayload, MappingPreviewResponse, ManualReviewItemResponse
 from .lineup import (
     LineupRequest,
     LineupResponse,
@@ -25,4 +25,5 @@ __all__ = [
     "PoolFilterResponse",
     "PoolFilterSummary",
     "PoolFilteredLineup",
+    "ManualReviewItemResponse",
 ]

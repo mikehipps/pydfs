@@ -216,3 +216,29 @@ def test_merge_handles_defense_names(tmp_path: Path):
     assert report.matched_players == 1
     assert records[0].team == "MIA"
     assert records[0].positions == ["D"]
+
+
+def test_merge_infers_defense_team_from_name(tmp_path: Path):
+    players_csv = tmp_path / "players.csv"
+    players_csv.write_text(
+        "Id,Position,First Name,Last Name,Team,Salary,FPPG\n"
+        "20,DEF,Baltimore,Ravens,,4600,6.2\n"
+    )
+
+    projections_csv = tmp_path / "projections.csv"
+    projections_csv.write_text(
+        "player,team,salary,fantasy\n"
+        "Baltimore D/ST,,4500,7.5\n"
+    )
+
+    records, report = merge_player_and_projection_files(
+        players_path=players_csv,
+        projections_path=projections_csv,
+        site="FD",
+        sport="NFL",
+        projection_mapping={"name": "player", "team": "team", "salary": "salary", "projection": "fantasy"},
+    )
+
+    assert report.matched_players == 1
+    assert records[0].team == "BAL"
+    assert records[0].positions == ["D"]
